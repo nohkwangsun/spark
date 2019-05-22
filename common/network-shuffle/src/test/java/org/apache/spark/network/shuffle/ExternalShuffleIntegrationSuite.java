@@ -58,6 +58,7 @@ public class ExternalShuffleIntegrationSuite {
   static ExternalShuffleBlockHandler handler;
   static TransportServer server;
   static TransportConf conf;
+  static TransportContext transportContext;
 
   static byte[][] exec0Blocks = new byte[][] {
     new byte[123],
@@ -87,7 +88,7 @@ public class ExternalShuffleIntegrationSuite {
 
     conf = new TransportConf("shuffle", MapConfigProvider.EMPTY);
     handler = new ExternalShuffleBlockHandler(conf, null);
-    TransportContext transportContext = new TransportContext(conf, handler);
+    transportContext = new TransportContext(conf, handler);
     server = transportContext.createServer();
   }
 
@@ -95,6 +96,7 @@ public class ExternalShuffleIntegrationSuite {
   public static void afterAll() {
     dataContext0.cleanup();
     server.close();
+    transportContext.close();
   }
 
   @After
@@ -133,37 +135,37 @@ public class ExternalShuffleIntegrationSuite {
 
     final Semaphore requestsRemaining = new Semaphore(0);
 
-    ExternalShuffleClient client = new ExternalShuffleClient(clientConf, null, false);
-    client.init(APP_ID);
-    client.fetchBlocks(TestUtils.getLocalHost(), port, execId, blockIds,
-      new BlockFetchingListener() {
-        @Override
-        public void onBlockFetchSuccess(String blockId, ManagedBuffer data) {
-          synchronized (this) {
-            if (!res.successBlocks.contains(blockId) && !res.failedBlocks.contains(blockId)) {
-              data.retain();
-              res.successBlocks.add(blockId);
-              res.buffers.add(data);
-              requestsRemaining.release();
+    try (ExternalShuffleClient client = new ExternalShuffleClient(clientConf, null, false, 5000)) {
+      client.init(APP_ID);
+      client.fetchBlocks(TestUtils.getLocalHost(), port, execId, blockIds,
+        new BlockFetchingListener() {
+          @Override
+          public void onBlockFetchSuccess(String blockId, ManagedBuffer data) {
+            synchronized (this) {
+              if (!res.successBlocks.contains(blockId) && !res.failedBlocks.contains(blockId)) {
+                data.retain();
+                res.successBlocks.add(blockId);
+                res.buffers.add(data);
+                requestsRemaining.release();
+              }
             }
           }
-        }
 
-        @Override
-        public void onBlockFetchFailure(String blockId, Throwable exception) {
-          synchronized (this) {
-            if (!res.successBlocks.contains(blockId) && !res.failedBlocks.contains(blockId)) {
-              res.failedBlocks.add(blockId);
-              requestsRemaining.release();
+          @Override
+          public void onBlockFetchFailure(String blockId, Throwable exception) {
+            synchronized (this) {
+              if (!res.successBlocks.contains(blockId) && !res.failedBlocks.contains(blockId)) {
+                res.failedBlocks.add(blockId);
+                requestsRemaining.release();
+              }
             }
           }
-        }
-      });
+        }, null);
 
-    if (!requestsRemaining.tryAcquire(blockIds.length, 5, TimeUnit.SECONDS)) {
-      fail("Timeout getting response from the server");
+      if (!requestsRemaining.tryAcquire(blockIds.length, 5, TimeUnit.SECONDS)) {
+        fail("Timeout getting response from the server");
+      }
     }
-    client.close();
     return res;
   }
 
@@ -214,11 +216,10 @@ public class ExternalShuffleIntegrationSuite {
   @Test
   public void testFetchWrongExecutor() throws Exception {
     registerExecutor("exec-0", dataContext0.createExecutorInfo(SORT_MANAGER));
-    FetchResult execFetch = fetchBlocks("exec-0",
-      new String[] { "shuffle_0_0_0" /* right */, "shuffle_1_0_0" /* wrong */ });
-    // Both still fail, as we start by checking for all block.
-    assertTrue(execFetch.successBlocks.isEmpty());
-    assertEquals(Sets.newHashSet("shuffle_0_0_0", "shuffle_1_0_0"), execFetch.failedBlocks);
+    FetchResult execFetch0 = fetchBlocks("exec-0", new String[] { "shuffle_0_0_0" /* right */});
+    FetchResult execFetch1 = fetchBlocks("exec-0", new String[] { "shuffle_1_0_0" /* wrong */ });
+    assertEquals(Sets.newHashSet("shuffle_0_0_0"), execFetch0.successBlocks);
+    assertEquals(Sets.newHashSet("shuffle_1_0_0"), execFetch1.failedBlocks);
   }
 
   @Test
@@ -243,7 +244,7 @@ public class ExternalShuffleIntegrationSuite {
 
   private static void registerExecutor(String executorId, ExecutorShuffleInfo executorInfo)
       throws IOException, InterruptedException {
-    ExternalShuffleClient client = new ExternalShuffleClient(conf, null, false);
+    ExternalShuffleClient client = new ExternalShuffleClient(conf, null, false, 5000);
     client.init(APP_ID);
     client.registerWithShuffleServer(TestUtils.getLocalHost(), server.getPort(),
       executorId, executorInfo);

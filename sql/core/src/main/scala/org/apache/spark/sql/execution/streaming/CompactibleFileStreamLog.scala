@@ -23,7 +23,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 import scala.io.{Source => IOSource}
 import scala.reflect.ClassTag
 
-import org.apache.hadoop.fs.{Path, PathFilter}
+import org.apache.hadoop.fs.Path
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
 
@@ -169,13 +169,15 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
    */
   private def compact(batchId: Long, logs: Array[T]): Boolean = {
     val validBatches = getValidBatchesBeforeCompactionBatch(batchId, compactInterval)
-    val allLogs = validBatches.flatMap(batchId => super.get(batchId)).flatten ++ logs
-    if (super.add(batchId, compactLogs(allLogs).toArray)) {
-      true
-    } else {
-      // Return false as there is another writer.
-      false
-    }
+    val allLogs = validBatches.flatMap { id =>
+      super.get(id).getOrElse {
+        throw new IllegalStateException(
+          s"${batchIdToPath(id)} doesn't exist when compacting batch $batchId " +
+            s"(compactInterval: $compactInterval)")
+      }
+    } ++ logs
+    // Return false as there is another writer.
+    super.add(batchId, compactLogs(allLogs).toArray)
   }
 
   /**
@@ -190,7 +192,13 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
       if (latestId >= 0) {
         try {
           val logs =
-            getAllValidBatches(latestId, compactInterval).flatMap(id => super.get(id)).flatten
+            getAllValidBatches(latestId, compactInterval).flatMap { id =>
+              super.get(id).getOrElse {
+                throw new IllegalStateException(
+                  s"${batchIdToPath(id)} doesn't exist " +
+                    s"(latestId: $latestId, compactInterval: $compactInterval)")
+              }
+            }
           return compactLogs(logs).toArray
         } catch {
           case e: IOException =>
@@ -232,15 +240,13 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
         s"min compaction batch id to delete = $minCompactionBatchId")
 
       val expiredTime = System.currentTimeMillis() - fileCleanupDelayMs
-      fileManager.list(metadataPath, new PathFilter {
-        override def accept(path: Path): Boolean = {
-          try {
-            val batchId = getBatchIdFromFileName(path.getName)
-            batchId < minCompactionBatchId
-          } catch {
-            case _: NumberFormatException =>
-              false
-          }
+      fileManager.list(metadataPath, (path: Path) => {
+        try {
+          val batchId = getBatchIdFromFileName(path.getName)
+          batchId < minCompactionBatchId
+        } catch {
+          case _: NumberFormatException =>
+            false
         }
       }).foreach { f =>
         if (f.getModificationTime <= expiredTime) {

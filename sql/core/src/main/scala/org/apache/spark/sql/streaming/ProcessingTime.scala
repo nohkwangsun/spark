@@ -21,13 +21,10 @@ import java.util.concurrent.TimeUnit
 
 import scala.concurrent.duration.Duration
 
-import org.apache.commons.lang3.StringUtils
-
-import org.apache.spark.annotation.{Experimental, InterfaceStability}
+import org.apache.spark.annotation.Evolving
 import org.apache.spark.unsafe.types.CalendarInterval
 
 /**
- * :: Experimental ::
  * A trigger that runs a query periodically based on the processing time. If `interval` is 0,
  * the query will run as fast as possible.
  *
@@ -49,21 +46,18 @@ import org.apache.spark.unsafe.types.CalendarInterval
  *
  * @since 2.0.0
  */
-@Experimental
-@InterfaceStability.Evolving
+@Evolving
 @deprecated("use Trigger.ProcessingTime(intervalMs)", "2.2.0")
 case class ProcessingTime(intervalMs: Long) extends Trigger {
   require(intervalMs >= 0, "the interval of trigger should not be negative")
 }
 
 /**
- * :: Experimental ::
  * Used to create [[ProcessingTime]] triggers for [[StreamingQuery]]s.
  *
  * @since 2.0.0
  */
-@Experimental
-@InterfaceStability.Evolving
+@Evolving
 @deprecated("use Trigger.ProcessingTime(intervalMs)", "2.2.0")
 object ProcessingTime {
 
@@ -80,22 +74,11 @@ object ProcessingTime {
    */
   @deprecated("use Trigger.ProcessingTime(interval)", "2.2.0")
   def apply(interval: String): ProcessingTime = {
-    if (StringUtils.isBlank(interval)) {
-      throw new IllegalArgumentException(
-        "interval cannot be null or blank.")
-    }
-    val cal = if (interval.startsWith("interval")) {
-      CalendarInterval.fromString(interval)
-    } else {
-      CalendarInterval.fromString("interval " + interval)
-    }
-    if (cal == null) {
-      throw new IllegalArgumentException(s"Invalid interval: $interval")
-    }
+    val cal = CalendarInterval.fromCaseInsensitiveString(interval)
     if (cal.months > 0) {
       throw new IllegalArgumentException(s"Doesn't support month or year interval: $interval")
     }
-    new ProcessingTime(cal.microseconds / 1000)
+    new ProcessingTime(TimeUnit.MICROSECONDS.toMillis(cal.microseconds))
   }
 
   /**

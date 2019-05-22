@@ -34,14 +34,14 @@ import org.apache.spark.sql.streaming._
  * To run this on your local machine, you need to first run a Netcat server
  * `$ nc -lk 9999`
  * and then run the example
- * `$ bin/run-example sql.streaming.StructuredNetworkWordCount
+ * `$ bin/run-example sql.streaming.StructuredSessionization
  * localhost 9999`
  */
 object StructuredSessionization {
 
   def main(args: Array[String]): Unit = {
     if (args.length < 2) {
-      System.err.println("Usage: StructuredNetworkWordCount <hostname> <port>")
+      System.err.println("Usage: StructuredSessionization <hostname> <port>")
       System.exit(1)
     }
 
@@ -70,7 +70,7 @@ object StructuredSessionization {
         line.split(" ").map(word => Event(sessionId = word, timestamp))
       }
 
-    // Sessionize the events. Track number of events, start and end timestamps of session, and
+    // Sessionize the events. Track number of events, start and end timestamps of session,
     // and report session updates.
     val sessionUpdates = events
       .groupByKey(event => event.sessionId)
