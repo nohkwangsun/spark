@@ -67,12 +67,18 @@ class OrcFileFormat extends FileFormat with DataSourceRegister with Serializable
       sparkSession: SparkSession,
       options: Map[String, String],
       files: Seq[FileStatus]): Option[StructType] = {
-    val ignoreCorruptFiles = sparkSession.sessionState.conf.ignoreCorruptFiles
-    OrcFileOperator.readSchema(
-      files.map(_.getPath.toString),
-      Some(sparkSession.sessionState.newHadoopConf()),
-      ignoreCorruptFiles
-    )
+    val orcOptions = new OrcOptions(options, sparkSession.sessionState.conf)
+    if (orcOptions.mergeSchema) {
+      SchemaMergeUtils.mergeSchemasInParallel(
+        sparkSession, options, files, OrcFileOperator.readOrcSchemasInParallel)
+    } else {
+      val ignoreCorruptFiles = sparkSession.sessionState.conf.ignoreCorruptFiles
+      OrcFileOperator.readSchema(
+        files.map(_.getPath.toString),
+        Some(sparkSession.sessionState.newHadoopConf()),
+        ignoreCorruptFiles
+      )
+    }
   }
 
   override def prepareWrite(

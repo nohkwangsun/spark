@@ -23,7 +23,7 @@ import numpy
 
 from pyspark import RDD, since
 from pyspark.mllib.common import callMLlibFunc, _py2java, _java2py
-from pyspark.mllib.linalg import SparseVector, _convert_to_vector
+from pyspark.mllib.linalg import _convert_to_vector
 from pyspark.mllib.regression import (
     LabeledPoint, LinearModel, _regression_train_wrapper,
     StreamingLinearAlgorithm)
@@ -102,6 +102,7 @@ class LogisticRegressionModel(LinearClassificationModel):
       in Multinomial Logistic Regression. By default, it is binary
       logistic regression so numClasses will be set to 2.
 
+    >>> from pyspark.mllib.linalg import SparseVector
     >>> data = [
     ...     LabeledPoint(0.0, [0.0, 1.0]),
     ...     LabeledPoint(1.0, [1.0, 0.0]),
@@ -410,6 +411,7 @@ class SVMModel(LinearClassificationModel):
     :param intercept:
       Intercept computed for this model.
 
+    >>> from pyspark.mllib.linalg import SparseVector
     >>> data = [
     ...     LabeledPoint(0.0, [0.0]),
     ...     LabeledPoint(1.0, [1.0]),
@@ -569,6 +571,7 @@ class NaiveBayesModel(Saveable, Loader):
       Log of class conditional probabilities, whose dimension is C-by-D,
       where D is number of features.
 
+    >>> from pyspark.mllib.linalg import SparseVector
     >>> data = [
     ...     LabeledPoint(0.0, [0.0, 0.0]),
     ...     LabeledPoint(0.0, [0.0, 1.0]),
@@ -659,11 +662,11 @@ class NaiveBayes(object):
         Train a Naive Bayes model given an RDD of (label, features)
         vectors.
 
-        This is the Multinomial NB (U{http://tinyurl.com/lsdw6p}) which
+        This is the `Multinomial NB <http://tinyurl.com/lsdw6p>`_ which
         can handle all kinds of discrete data.  For example, by
         converting documents into TF-IDF vectors, it can be used for
         document classification. By making every vector a 0-1 vector,
-        it can also be used as Bernoulli NB (U{http://tinyurl.com/p7c96j6}).
+        it can also be used as `Bernoulli NB <http://tinyurl.com/p7c96j6>`_.
         The input feature values must be nonnegative.
 
         :param data:

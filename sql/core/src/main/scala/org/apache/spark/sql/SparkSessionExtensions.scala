@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.execution.{ColumnarRule, SparkPlan}
 
 /**
  * :: Experimental ::
@@ -42,6 +43,8 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * <li>Planning Strategies.</li>
  * <li>Customized Parser.</li>
  * <li>(External) Catalog listeners.</li>
+ * <li>Columnar Rules.</li>
+ * <li>Adaptive Query Stage Preparation Rules.</li>
  * </ul>
  *
  * The extensions can be used by calling `withExtensions` on the [[SparkSession.Builder]], for
@@ -93,6 +96,40 @@ class SparkSessionExtensions {
   type StrategyBuilder = SparkSession => Strategy
   type ParserBuilder = (SparkSession, ParserInterface) => ParserInterface
   type FunctionDescription = (FunctionIdentifier, ExpressionInfo, FunctionBuilder)
+  type ColumnarRuleBuilder = SparkSession => ColumnarRule
+  type QueryStagePrepRuleBuilder = SparkSession => Rule[SparkPlan]
+
+  private[this] val columnarRuleBuilders = mutable.Buffer.empty[ColumnarRuleBuilder]
+  private[this] val queryStagePrepRuleBuilders = mutable.Buffer.empty[QueryStagePrepRuleBuilder]
+
+  /**
+   * Build the override rules for columnar execution.
+   */
+  private[sql] def buildColumnarRules(session: SparkSession): Seq[ColumnarRule] = {
+    columnarRuleBuilders.map(_.apply(session)).toSeq
+  }
+
+  /**
+   * Build the override rules for the query stage preparation phase of adaptive query execution.
+   */
+  private[sql] def buildQueryStagePrepRules(session: SparkSession): Seq[Rule[SparkPlan]] = {
+    queryStagePrepRuleBuilders.map(_.apply(session)).toSeq
+  }
+
+  /**
+   * Inject a rule that can override the columnar execution of an executor.
+   */
+  def injectColumnar(builder: ColumnarRuleBuilder): Unit = {
+    columnarRuleBuilders += builder
+  }
+
+  /**
+   * Inject a rule that can override the the query stage preparation phase of adaptive query
+   * execution.
+   */
+  def injectQueryStagePrepRule(builder: QueryStagePrepRuleBuilder): Unit = {
+    queryStagePrepRuleBuilders += builder
+  }
 
   private[this] val resolutionRuleBuilders = mutable.Buffer.empty[RuleBuilder]
 
@@ -100,7 +137,7 @@ class SparkSessionExtensions {
    * Build the analyzer resolution `Rule`s using the given [[SparkSession]].
    */
   private[sql] def buildResolutionRules(session: SparkSession): Seq[Rule[LogicalPlan]] = {
-    resolutionRuleBuilders.map(_.apply(session))
+    resolutionRuleBuilders.map(_.apply(session)).toSeq
   }
 
   /**
@@ -117,7 +154,7 @@ class SparkSessionExtensions {
    * Build the analyzer post-hoc resolution `Rule`s using the given [[SparkSession]].
    */
   private[sql] def buildPostHocResolutionRules(session: SparkSession): Seq[Rule[LogicalPlan]] = {
-    postHocResolutionRuleBuilders.map(_.apply(session))
+    postHocResolutionRuleBuilders.map(_.apply(session)).toSeq
   }
 
   /**
@@ -134,7 +171,7 @@ class SparkSessionExtensions {
    * Build the check analysis `Rule`s using the given [[SparkSession]].
    */
   private[sql] def buildCheckRules(session: SparkSession): Seq[LogicalPlan => Unit] = {
-    checkRuleBuilders.map(_.apply(session))
+    checkRuleBuilders.map(_.apply(session)).toSeq
   }
 
   /**
@@ -149,7 +186,7 @@ class SparkSessionExtensions {
   private[this] val optimizerRules = mutable.Buffer.empty[RuleBuilder]
 
   private[sql] def buildOptimizerRules(session: SparkSession): Seq[Rule[LogicalPlan]] = {
-    optimizerRules.map(_.apply(session))
+    optimizerRules.map(_.apply(session)).toSeq
   }
 
   /**
@@ -165,7 +202,7 @@ class SparkSessionExtensions {
   private[this] val plannerStrategyBuilders = mutable.Buffer.empty[StrategyBuilder]
 
   private[sql] def buildPlannerStrategies(session: SparkSession): Seq[Strategy] = {
-    plannerStrategyBuilders.map(_.apply(session))
+    plannerStrategyBuilders.map(_.apply(session)).toSeq
   }
 
   /**

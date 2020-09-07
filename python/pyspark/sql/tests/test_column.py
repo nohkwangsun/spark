@@ -16,10 +16,8 @@
 # limitations under the License.
 #
 
-import sys
-
 from pyspark.sql import Column, Row
-from pyspark.sql.types import *
+from pyspark.sql.types import StructType, StructField, LongType
 from pyspark.sql.utils import AnalysisException
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
@@ -85,7 +83,7 @@ class ColumnTests(ReusedSQLTestCase):
                                 "Cannot apply 'in' operator against a column",
                                 lambda: 1 in cs)
 
-    def test_column_getitem(self):
+    def test_column_accessor(self):
         from pyspark.sql.functions import col
 
         self.assertIsInstance(col("foo")[1:3], Column)
@@ -109,12 +107,8 @@ class ColumnTests(ReusedSQLTestCase):
         self.assertRaises(TypeError, lambda: df[{}])
 
     def test_column_name_with_non_ascii(self):
-        if sys.version >= '3':
-            columnName = "数量"
-            self.assertTrue(isinstance(columnName, str))
-        else:
-            columnName = unicode("数量", "utf-8")
-            self.assertTrue(isinstance(columnName, unicode))
+        columnName = "数量"
+        self.assertTrue(isinstance(columnName, str))
         schema = StructType([StructField(columnName, LongType(), True)])
         df = self.spark.createDataFrame([(1,)], schema)
         self.assertEqual(schema, df.schema)
@@ -148,11 +142,11 @@ class ColumnTests(ReusedSQLTestCase):
 
 if __name__ == "__main__":
     import unittest
-    from pyspark.sql.tests.test_column import *
+    from pyspark.sql.tests.test_column import *  # noqa: F401
 
     try:
         import xmlrunner
-        testRunner = xmlrunner.XMLTestRunner(output='target/test-reports')
+        testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
     except ImportError:
         testRunner = None
     unittest.main(testRunner=testRunner, verbosity=2)

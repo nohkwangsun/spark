@@ -18,7 +18,7 @@
 package org.apache.spark.deploy.master
 
 import java.util.Date
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.JavaConverters._
@@ -31,8 +31,10 @@ import scala.reflect.ClassTag
 import org.json4s._
 import org.json4s.jackson.JsonMethods._
 import org.mockito.Mockito.{mock, when}
-import org.scalatest.{BeforeAndAfter, Matchers, PrivateMethodTester}
+import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
 import org.scalatest.concurrent.Eventually
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 import other.supplier.{CustomPersistenceEngine, CustomRecoveryModeFactory}
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
@@ -42,6 +44,8 @@ import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Deploy._
 import org.apache.spark.internal.config.UI._
 import org.apache.spark.internal.config.Worker._
+import org.apache.spark.resource.{ResourceInformation, ResourceRequirement}
+import org.apache.spark.resource.ResourceUtils.{FPGA, GPU}
 import org.apache.spark.rpc.{RpcAddress, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.serializer
 
@@ -68,17 +72,23 @@ class MockWorker(master: RpcEndpointRef, conf: SparkConf = new SparkConf) extend
     })
   }
 
-  val appDesc = DeployTestUtils.createAppDesc()
+  var appDesc = DeployTestUtils.createAppDesc()
   val drivers = mutable.HashSet[String]()
+  val driverResources = new mutable.HashMap[String, Map[String, Set[String]]]
+  val execResources = new mutable.HashMap[String, Map[String, Set[String]]]
   override def receive: PartialFunction[Any, Unit] = {
-    case RegisteredWorker(masterRef, _, _) =>
+    case RegisteredWorker(masterRef, _, _, _) =>
       masterRef.send(WorkerLatestState(id, Nil, drivers.toSeq))
-    case LaunchDriver(driverId, desc) =>
+    case LaunchExecutor(_, appId, execId, _, _, _, resources_) =>
+      execResources(appId + "/" + execId) = resources_.map(r => (r._1, r._2.addresses.toSet))
+    case LaunchDriver(driverId, desc, resources_) =>
       drivers += driverId
+      driverResources(driverId) = resources_.map(r => (r._1, r._2.addresses.toSet))
       master.send(RegisterApplication(appDesc, newDriver(driverId)))
     case KillDriver(driverId) =>
       master.send(DriverStateChanged(driverId, DriverState.KILLED, None))
       drivers -= driverId
+      driverResources.remove(driverId)
       driverIdToAppId.get(driverId) match {
         case Some(appId) =>
           apps.remove(appId)
@@ -89,13 +99,40 @@ class MockWorker(master: RpcEndpointRef, conf: SparkConf = new SparkConf) extend
   }
 }
 
-class MockExecutorLaunchFailWorker(master: RpcEndpointRef, conf: SparkConf = new SparkConf)
-  extends MockWorker(master, conf) {
+// This class is designed to handle the lifecycle of only one application.
+class MockExecutorLaunchFailWorker(master: Master, conf: SparkConf = new SparkConf)
+  extends MockWorker(master.self, conf) with Eventually {
+
+  val appRegistered = new CountDownLatch(1)
+  val launchExecutorReceived = new CountDownLatch(1)
+  val appIdsToLaunchExecutor = new mutable.HashSet[String]
   var failedCnt = 0
+
   override def receive: PartialFunction[Any, Unit] = {
-    case LaunchExecutor(_, appId, execId, _, _, _) =>
+    case LaunchDriver(driverId, _, _) =>
+      master.self.send(RegisterApplication(appDesc, newDriver(driverId)))
+
+      // Below code doesn't make driver stuck, as newDriver opens another rpc endpoint for
+      // handling driver related messages. To simplify logic, we will block handling
+      // LaunchExecutor message until we validate registering app succeeds.
+      eventually(timeout(5.seconds)) {
+        // an app would be registered with Master once Driver set up
+        assert(apps.nonEmpty)
+        assert(master.idToApp.keySet.intersect(apps.keySet) == apps.keySet)
+      }
+
+      appRegistered.countDown()
+    case LaunchExecutor(_, appId, execId, _, _, _, _) =>
+      assert(appRegistered.await(10, TimeUnit.SECONDS))
+
+      if (failedCnt == 0) {
+        launchExecutorReceived.countDown()
+      }
+      assert(master.idToApp.contains(appId))
+      appIdsToLaunchExecutor += appId
       failedCnt += 1
-      master.send(ExecutorStateChanged(appId, execId, ExecutorState.FAILED, None, None))
+      master.self.send(ExecutorStateChanged(appId, execId, ExecutorState.FAILED, None, None))
+
     case otherMsg => super.receive(otherMsg)
   }
 }
@@ -167,7 +204,8 @@ class MasterSuite extends SparkFunSuite
       cores = 0,
       memory = 0,
       endpoint = null,
-      webUiAddress = "http://localhost:80"
+      webUiAddress = "http://localhost:80",
+      Map.empty
     )
 
     val (rpcEnv, _, _) =
@@ -248,9 +286,12 @@ class MasterSuite extends SparkFunSuite
         // Application state should be WAITING when "MasterChangeAcknowledged" event executed.
         fakeAppInfo.state should be(ApplicationState.WAITING)
       }
-
-      master.self.send(
-        WorkerSchedulerStateResponse(fakeWorkerInfo.id, fakeExecutors, Seq(fakeDriverInfo.id)))
+      val execResponse = fakeExecutors.map(exec =>
+        WorkerExecutorStateResponse(exec, Map.empty[String, ResourceInformation]))
+      val driverResponse = WorkerDriverStateResponse(
+        fakeDriverInfo.id, Map.empty[String, ResourceInformation])
+      master.self.send(WorkerSchedulerStateResponse(
+        fakeWorkerInfo.id, execResponse, Seq(driverResponse)))
 
       eventually(timeout(5.seconds), interval(100.milliseconds)) {
         getState(master) should be(RecoveryState.ALIVE)
@@ -530,9 +571,10 @@ class MasterSuite extends SparkFunSuite
   // | Utility methods and fields for testing |
   // ==========================================
 
-  private val _scheduleExecutorsOnWorkers = PrivateMethod[Array[Int]]('scheduleExecutorsOnWorkers)
-  private val _drivers = PrivateMethod[HashSet[DriverInfo]]('drivers)
-  private val _state = PrivateMethod[RecoveryState.Value]('state)
+  private val _scheduleExecutorsOnWorkers =
+    PrivateMethod[Array[Int]](Symbol("scheduleExecutorsOnWorkers"))
+  private val _drivers = PrivateMethod[HashSet[DriverInfo]](Symbol("drivers"))
+  private val _state = PrivateMethod[RecoveryState.Value](Symbol("state"))
 
   private val workerInfo = makeWorkerInfo(4096, 10)
   private val workerInfos = Array(workerInfo, workerInfo, workerInfo)
@@ -543,6 +585,16 @@ class MasterSuite extends SparkFunSuite
     val rpcEnv = RpcEnv.create(Master.SYSTEM_NAME, "localhost", 0, conf, securityMgr)
     _master = new Master(rpcEnv, rpcEnv.address, 0, securityMgr, conf)
     _master
+  }
+
+  def makeAliveMaster(conf: SparkConf = new SparkConf): Master = {
+    val master = makeMaster(conf)
+    master.rpcEnv.setupEndpoint(Master.ENDPOINT_NAME, master)
+    eventually(timeout(10.seconds)) {
+      val masterState = master.self.askSync[MasterStateResponse](RequestMasterState)
+      assert(masterState.status === RecoveryState.ALIVE, "Master is not alive")
+    }
+    master
   }
 
   private def makeAppInfo(
@@ -563,7 +615,8 @@ class MasterSuite extends SparkFunSuite
     val endpointRef = mock(classOf[RpcEndpointRef])
     val mockAddress = mock(classOf[RpcAddress])
     when(endpointRef.address).thenReturn(mockAddress)
-    new WorkerInfo(workerId, "host", 100, cores, memoryMb, endpointRef, "http://localhost:80")
+    new WorkerInfo(workerId, "host", 100, cores, memoryMb,
+      endpointRef, "http://localhost:80", Map.empty)
   }
 
   private def scheduleExecutorsOnWorkers(
@@ -575,13 +628,7 @@ class MasterSuite extends SparkFunSuite
   }
 
   test("SPARK-13604: Master should ask Worker kill unknown executors and drivers") {
-    val master = makeMaster()
-    master.rpcEnv.setupEndpoint(Master.ENDPOINT_NAME, master)
-    eventually(timeout(10.seconds)) {
-      val masterState = master.self.askSync[MasterStateResponse](RequestMasterState)
-      assert(masterState.status === RecoveryState.ALIVE, "Master is not alive")
-    }
-
+    val master = makeAliveMaster()
     val killedExecutors = new ConcurrentLinkedQueue[(String, Int)]()
     val killedDrivers = new ConcurrentLinkedQueue[String]()
     val fakeWorker = master.rpcEnv.setupEndpoint("worker", new RpcEndpoint {
@@ -614,19 +661,13 @@ class MasterSuite extends SparkFunSuite
   }
 
   test("SPARK-20529: Master should reply the address received from worker") {
-    val master = makeMaster()
-    master.rpcEnv.setupEndpoint(Master.ENDPOINT_NAME, master)
-    eventually(timeout(10.seconds)) {
-      val masterState = master.self.askSync[MasterStateResponse](RequestMasterState)
-      assert(masterState.status === RecoveryState.ALIVE, "Master is not alive")
-    }
-
+    val master = makeAliveMaster()
     @volatile var receivedMasterAddress: RpcAddress = null
     val fakeWorker = master.rpcEnv.setupEndpoint("worker", new RpcEndpoint {
       override val rpcEnv: RpcEnv = master.rpcEnv
 
       override def receive: PartialFunction[Any, Unit] = {
-        case RegisteredWorker(_, _, masterAddress) =>
+        case RegisteredWorker(_, _, masterAddress, _) =>
           receivedMasterAddress = masterAddress
       }
     })
@@ -647,16 +688,19 @@ class MasterSuite extends SparkFunSuite
   }
 
   test("SPARK-27510: Master should avoid dead loop while launching executor failed in Worker") {
-    val master = makeMaster()
-    master.rpcEnv.setupEndpoint(Master.ENDPOINT_NAME, master)
-    eventually(timeout(10.seconds)) {
-      val masterState = master.self.askSync[MasterStateResponse](RequestMasterState)
-      assert(masterState.status === RecoveryState.ALIVE, "Master is not alive")
-    }
-
+    val master = makeAliveMaster()
     var worker: MockExecutorLaunchFailWorker = null
     try {
-      worker = new MockExecutorLaunchFailWorker(master.self)
+      val conf = new SparkConf()
+      // SPARK-32250: When running test on Github Action machine, the available processors in JVM
+      // is only 2, while on Jenkins it's 32. For this specific test, 2 available processors, which
+      // also decides number of threads in Dispatcher, is not enough to consume the messages. In
+      // the worst situation, MockExecutorLaunchFailWorker would occupy these 2 threads for
+      // handling messages LaunchDriver, LaunchExecutor at the same time but leave no thread for
+      // the driver to handle the message RegisteredApplication. At the end, it results in the dead
+      // lock situation. Therefore, we need to set more threads to avoid the dead lock.
+      conf.set(Network.RPC_NETTY_DISPATCHER_NUM_THREADS, 6)
+      worker = new MockExecutorLaunchFailWorker(master, conf)
       worker.rpcEnv.setupEndpoint("worker", worker)
       val workerRegMsg = RegisterWorker(
         worker.id,
@@ -671,19 +715,16 @@ class MasterSuite extends SparkFunSuite
       val driver = DeployTestUtils.createDriverDesc()
       // mimic DriverClient to send RequestSubmitDriver to master
       master.self.askSync[SubmitDriverResponse](RequestSubmitDriver(driver))
-      var appId: String = null
-      eventually(timeout(10.seconds)) {
-        // an app would be registered with Master once Driver set up
-        assert(worker.apps.nonEmpty)
-        appId = worker.apps.head._1
-        assert(master.idToApp.contains(appId))
-      }
+
+      // LaunchExecutor message should have been received in worker side
+      assert(worker.launchExecutorReceived.await(10, TimeUnit.SECONDS))
 
       eventually(timeout(10.seconds)) {
+        val appIds = worker.appIdsToLaunchExecutor
         // Master would continually launch executors until reach MAX_EXECUTOR_RETRIES
         assert(worker.failedCnt == master.conf.get(MAX_EXECUTOR_RETRIES))
         // Master would remove the app if no executor could be launched for it
-        assert(!master.idToApp.contains(appId))
+        assert(master.idToApp.keySet.intersect(appIds).isEmpty)
       }
     } finally {
       if (worker != null) {
@@ -695,14 +736,68 @@ class MasterSuite extends SparkFunSuite
     }
   }
 
-  test("SPARK-19900: there should be a corresponding driver for the app after relaunching driver") {
-    val conf = new SparkConf().set(WORKER_TIMEOUT, 1L)
-    val master = makeMaster(conf)
-    master.rpcEnv.setupEndpoint(Master.ENDPOINT_NAME, master)
+  def testWorkerDecommissioning(
+      numWorkers: Int,
+      numWorkersExpectedToDecom: Int,
+      hostnames: Seq[String]): Unit = {
+    val conf = new SparkConf()
+    val master = makeAliveMaster(conf)
+    val workerRegs = (1 to numWorkers).map{idx =>
+      val worker = new MockWorker(master.self, conf)
+      worker.rpcEnv.setupEndpoint("worker", worker)
+      val workerReg = RegisterWorker(
+        worker.id,
+        "localhost",
+        worker.self.address.port,
+        worker.self,
+        10,
+        1024,
+        "http://localhost:8080",
+        RpcAddress("localhost", 10000))
+      master.self.send(workerReg)
+      workerReg
+    }
+
     eventually(timeout(10.seconds)) {
       val masterState = master.self.askSync[MasterStateResponse](RequestMasterState)
-      assert(masterState.status === RecoveryState.ALIVE, "Master is not alive")
+      assert(masterState.workers.length === numWorkers)
+      assert(masterState.workers.forall(_.state == WorkerState.ALIVE))
+      assert(masterState.workers.map(_.id).toSet == workerRegs.map(_.id).toSet)
     }
+
+    val decomWorkersCount = master.self.askSync[Integer](DecommissionWorkersOnHosts(hostnames))
+    assert(decomWorkersCount === numWorkersExpectedToDecom)
+
+    // Decommissioning is actually async ... wait for the workers to actually be decommissioned by
+    // polling the master's state.
+    eventually(timeout(30.seconds)) {
+      val masterState = master.self.askSync[MasterStateResponse](RequestMasterState)
+      assert(masterState.workers.length === numWorkers)
+      val workersActuallyDecomed = masterState.workers.count(_.state == WorkerState.DECOMMISSIONED)
+      assert(workersActuallyDecomed === numWorkersExpectedToDecom)
+    }
+
+    // Decommissioning a worker again should return the same answer since we want this call to be
+    // idempotent.
+    val decomWorkersCountAgain = master.self.askSync[Integer](DecommissionWorkersOnHosts(hostnames))
+    assert(decomWorkersCountAgain === numWorkersExpectedToDecom)
+  }
+
+  test("All workers on a host should be decommissioned") {
+    testWorkerDecommissioning(2, 2, Seq("LoCalHost", "localHOST"))
+  }
+
+  test("No workers should be decommissioned with invalid host") {
+    testWorkerDecommissioning(2, 0, Seq("NoSuchHost1", "NoSuchHost2"))
+  }
+
+  test("Only worker on host should be decommissioned") {
+    testWorkerDecommissioning(1, 1, Seq("lOcalHost", "NoSuchHost"))
+  }
+
+  test("SPARK-19900: there should be a corresponding driver for the app after relaunching driver") {
+    val conf = new SparkConf().set(WORKER_TIMEOUT, 1L)
+    val master = makeAliveMaster(conf)
     var worker1: MockWorker = null
     var worker2: MockWorker = null
     try {
@@ -767,6 +862,95 @@ class MasterSuite extends SparkFunSuite
       if (worker2 != null) {
         worker2.rpcEnv.shutdown()
       }
+    }
+  }
+
+  test("assign/recycle resources to/from driver") {
+    val master = makeAliveMaster()
+    val masterRef = master.self
+    val resourceReqs = Seq(ResourceRequirement(GPU, 3), ResourceRequirement(FPGA, 3))
+    val driver = DeployTestUtils.createDriverDesc().copy(resourceReqs = resourceReqs)
+    val driverId = masterRef.askSync[SubmitDriverResponse](
+      RequestSubmitDriver(driver)).driverId.get
+    var status = masterRef.askSync[DriverStatusResponse](RequestDriverStatus(driverId))
+    assert(status.state === Some(DriverState.SUBMITTED))
+    val worker = new MockWorker(masterRef)
+    worker.rpcEnv.setupEndpoint(s"worker", worker)
+    val resources = Map(GPU -> new ResourceInformation(GPU, Array("0", "1", "2")),
+      FPGA -> new ResourceInformation(FPGA, Array("f1", "f2", "f3")))
+    val regMsg = RegisterWorker(worker.id, "localhost", 7077, worker.self, 10, 1024,
+      "http://localhost:8080", RpcAddress("localhost", 10000), resources)
+    masterRef.send(regMsg)
+    eventually(timeout(10.seconds)) {
+      status = masterRef.askSync[DriverStatusResponse](RequestDriverStatus(driverId))
+      assert(status.state === Some(DriverState.RUNNING))
+      assert(worker.drivers.head === driverId)
+      assert(worker.driverResources(driverId) === Map(GPU -> Set("0", "1", "2"),
+        FPGA -> Set("f1", "f2", "f3")))
+      val workerResources = master.workers.head.resources
+      assert(workerResources(GPU).availableAddrs.length === 0)
+      assert(workerResources(GPU).assignedAddrs.toSet === Set("0", "1", "2"))
+      assert(workerResources(FPGA).availableAddrs.length === 0)
+      assert(workerResources(FPGA).assignedAddrs.toSet === Set("f1", "f2", "f3"))
+    }
+    val driverFinished = DriverStateChanged(driverId, DriverState.FINISHED, None)
+    masterRef.send(driverFinished)
+    eventually(timeout(10.seconds)) {
+      val workerResources = master.workers.head.resources
+      assert(workerResources(GPU).availableAddrs.length === 3)
+      assert(workerResources(GPU).assignedAddrs.toSet === Set())
+      assert(workerResources(FPGA).availableAddrs.length === 3)
+      assert(workerResources(FPGA).assignedAddrs.toSet === Set())
+    }
+  }
+
+  test("assign/recycle resources to/from executor") {
+
+    def makeWorkerAndRegister(
+        master: RpcEndpointRef,
+        workerResourceReqs: Map[String, Int] = Map.empty)
+    : MockWorker = {
+      val worker = new MockWorker(master)
+      worker.rpcEnv.setupEndpoint(s"worker", worker)
+      val resources = workerResourceReqs.map { case (rName, amount) =>
+        val shortName = rName.charAt(0)
+        val addresses = (0 until amount).map(i => s"$shortName$i").toArray
+        rName -> new ResourceInformation(rName, addresses)
+      }
+      val reg = RegisterWorker(worker.id, "localhost", 8077, worker.self, 10, 2048,
+        "http://localhost:8080", RpcAddress("localhost", 10000), resources)
+      master.send(reg)
+      worker
+    }
+
+    val master = makeAliveMaster()
+    val masterRef = master.self
+    val resourceReqs = Seq(ResourceRequirement(GPU, 3), ResourceRequirement(FPGA, 3))
+    val worker = makeWorkerAndRegister(masterRef, Map(GPU -> 6, FPGA -> 6))
+    worker.appDesc = worker.appDesc.copy(resourceReqsPerExecutor = resourceReqs)
+    val driver = DeployTestUtils.createDriverDesc().copy(resourceReqs = resourceReqs)
+    val driverId = masterRef.askSync[SubmitDriverResponse](RequestSubmitDriver(driver)).driverId
+    val status = masterRef.askSync[DriverStatusResponse](RequestDriverStatus(driverId.get))
+    assert(status.state === Some(DriverState.RUNNING))
+    val workerResources = master.workers.head.resources
+    eventually(timeout(10.seconds)) {
+      assert(workerResources(GPU).availableAddrs.length === 0)
+      assert(workerResources(FPGA).availableAddrs.length === 0)
+      assert(worker.driverResources.size === 1)
+      assert(worker.execResources.size === 1)
+      val driverResources = worker.driverResources.head._2
+      val execResources = worker.execResources.head._2
+      val gpuAddrs = driverResources(GPU).union(execResources(GPU))
+      val fpgaAddrs = driverResources(FPGA).union(execResources(FPGA))
+      assert(gpuAddrs === Set("g0", "g1", "g2", "g3", "g4", "g5"))
+      assert(fpgaAddrs === Set("f0", "f1", "f2", "f3", "f4", "f5"))
+    }
+    val appId = worker.apps.head._1
+    masterRef.send(UnregisterApplication(appId))
+    masterRef.send(DriverStateChanged(driverId.get, DriverState.FINISHED, None))
+    eventually(timeout(10.seconds)) {
+      assert(workerResources(GPU).availableAddrs.length === 6)
+      assert(workerResources(FPGA).availableAddrs.length === 6)
     }
   }
 

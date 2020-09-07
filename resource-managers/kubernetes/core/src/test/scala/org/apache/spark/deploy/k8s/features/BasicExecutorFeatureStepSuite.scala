@@ -26,12 +26,17 @@ import com.google.common.net.InternetDomainName
 import io.fabric8.kubernetes.api.model._
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
+import org.apache.spark.{SecurityManager, SparkConf, SparkException, SparkFunSuite}
 import org.apache.spark.deploy.k8s.{KubernetesExecutorConf, KubernetesTestConf, SparkPod}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
+import org.apache.spark.deploy.k8s.features.KubernetesFeaturesTestUtils.TestResourceInformation
 import org.apache.spark.internal.config
+import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Python._
+import org.apache.spark.resource.ResourceID
+import org.apache.spark.resource.ResourceUtils._
+import org.apache.spark.resource.TestResourceIDs._
 import org.apache.spark.rpc.RpcEndpointAddress
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
 import org.apache.spark.util.Utils
@@ -90,6 +95,47 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
       environment = environment)
   }
 
+  test("test spark resource missing vendor") {
+    baseConf.set(EXECUTOR_GPU_ID.amountConf, "2")
+    val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf))
+    val error = intercept[SparkException] {
+      val executor = step.configurePod(SparkPod.initialPod())
+    }.getMessage()
+    assert(error.contains("Resource: gpu was requested, but vendor was not specified"))
+  }
+
+  test("test spark resource missing amount") {
+    baseConf.set(EXECUTOR_GPU_ID.vendorConf, "nvidia.com")
+
+    val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf))
+    val error = intercept[SparkException] {
+      val executor = step.configurePod(SparkPod.initialPod())
+    }.getMessage()
+    assert(error.contains("You must specify an amount for gpu"))
+  }
+
+  test("basic executor pod with resources") {
+    val fpgaResourceID = new ResourceID(SPARK_EXECUTOR_PREFIX, FPGA)
+    val gpuExecutorResourceID = new ResourceID(SPARK_EXECUTOR_PREFIX, GPU)
+    val gpuResources =
+      Map(("nvidia.com/gpu" -> TestResourceInformation(gpuExecutorResourceID, "2", "nvidia.com")),
+      ("foo.com/fpga" -> TestResourceInformation(fpgaResourceID, "1", "foo.com")))
+    gpuResources.foreach { case (_, testRInfo) =>
+      baseConf.set(testRInfo.rId.amountConf, testRInfo.count)
+      baseConf.set(testRInfo.rId.vendorConf, testRInfo.vendor)
+    }
+    val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf))
+    val executor = step.configurePod(SparkPod.initialPod())
+
+    assert(executor.container.getResources.getLimits.size() === 3)
+    assert(amountAndFormat(executor.container.getResources
+      .getLimits.get("memory")) === "1408Mi")
+    gpuResources.foreach { case (k8sName, testRInfo) =>
+      assert(amountAndFormat(
+        executor.container.getResources.getLimits.get(k8sName)) === testRInfo.count)
+    }
+  }
+
   test("basic executor pod has reasonable defaults") {
     val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf))
     val executor = step.configurePod(SparkPod.initialPod())
@@ -106,8 +152,8 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     assert(executor.container.getImage === EXECUTOR_IMAGE)
     assert(executor.container.getVolumeMounts.isEmpty)
     assert(executor.container.getResources.getLimits.size() === 1)
-    assert(executor.container.getResources
-      .getLimits.get("memory").getAmount === "1408Mi")
+    assert(amountAndFormat(executor.container.getResources
+      .getLimits.get("memory")) === "1408Mi")
 
     // The pod has no node selector, volumes.
     assert(executor.pod.getSpec.getNodeSelector.isEmpty)
@@ -149,6 +195,16 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     checkOwnerReferences(executor.pod, DRIVER_POD_UID)
   }
 
+  test("SPARK-32655 Support appId/execId placeholder in SPARK_EXECUTOR_DIRS") {
+    val kconf = newExecutorConf(environment = Map(ENV_EXECUTOR_DIRS ->
+      "/p1/SPARK_APPLICATION_ID/SPARK_EXECUTOR_ID,/p2/SPARK_APPLICATION_ID/SPARK_EXECUTOR_ID"))
+    val step = new BasicExecutorFeatureStep(kconf, new SecurityManager(baseConf))
+    val executor = step.configurePod(SparkPod.initialPod())
+
+    checkEnv(executor, baseConf, Map(ENV_EXECUTOR_DIRS ->
+      s"/p1/${KubernetesTestConf.APP_ID}/1,/p2/${KubernetesTestConf.APP_ID}/1"))
+  }
+
   test("test executor pyspark memory") {
     baseConf.set("spark.kubernetes.resource.type", "python")
     baseConf.set(PYSPARK_EXECUTOR_MEMORY, 42L)
@@ -156,7 +212,7 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     val step = new BasicExecutorFeatureStep(newExecutorConf(), new SecurityManager(baseConf))
     val executor = step.configurePod(SparkPod.initialPod())
     // This is checking that basic executor + executorMemory = 1408 + 42 = 1450
-    assert(executor.container.getResources.getRequests.get("memory").getAmount === "1450Mi")
+    assert(amountAndFormat(executor.container.getResources.getRequests.get("memory")) === "1450Mi")
   }
 
   test("auth secret propagation") {
@@ -228,4 +284,6 @@ class BasicExecutorFeatureStepSuite extends SparkFunSuite with BeforeAndAfter {
     val expectedEnvs = defaultEnvs ++ additionalEnvVars ++ extraJavaOptsEnvs
     assert(containerEnvs === expectedEnvs)
   }
+
+  private def amountAndFormat(quantity: Quantity): String = quantity.getAmount + quantity.getFormat
 }

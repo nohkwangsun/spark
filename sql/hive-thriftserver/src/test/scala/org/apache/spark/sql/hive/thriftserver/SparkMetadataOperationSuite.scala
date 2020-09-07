@@ -17,171 +17,336 @@
 
 package org.apache.spark.sql.hive.thriftserver
 
-import java.util.{Arrays => JArrays, List => JList, Properties}
+import java.sql.{DatabaseMetaData, ResultSet}
 
-import org.apache.hive.jdbc.{HiveConnection, HiveQueryResultSet, Utils => JdbcUtils}
-import org.apache.hive.service.auth.PlainSaslHelper
-import org.apache.hive.service.cli.thrift._
-import org.apache.thrift.protocol.TBinaryProtocol
-import org.apache.thrift.transport.TSocket
+import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
+import org.apache.spark.sql.types._
 
 class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
 
   override def mode: ServerMode.Value = ServerMode.binary
 
   test("Spark's own GetSchemasOperation(SparkGetSchemasOperation)") {
-    def testGetSchemasOperation(
-        catalog: String,
-        schemaPattern: String)(f: HiveQueryResultSet => Unit): Unit = {
-      val rawTransport = new TSocket("localhost", serverPort)
-      val connection = new HiveConnection(s"jdbc:hive2://localhost:$serverPort", new Properties)
-      val user = System.getProperty("user.name")
-      val transport = PlainSaslHelper.getPlainTransport(user, "anonymous", rawTransport)
-      val client = new TCLIService.Client(new TBinaryProtocol(transport))
-      transport.open()
-      var rs: HiveQueryResultSet = null
-      try {
-        val openResp = client.OpenSession(new TOpenSessionReq)
-        val sessHandle = openResp.getSessionHandle
-        val schemaReq = new TGetSchemasReq(sessHandle)
-
-        if (catalog != null) {
-          schemaReq.setCatalogName(catalog)
-        }
-
-        if (schemaPattern == null) {
-          schemaReq.setSchemaName("%")
-        } else {
-          schemaReq.setSchemaName(schemaPattern)
-        }
-
-        val schemaResp = client.GetSchemas(schemaReq)
-        JdbcUtils.verifySuccess(schemaResp.getStatus)
-
-        rs = new HiveQueryResultSet.Builder(connection)
-          .setClient(client)
-          .setSessionHandle(sessHandle)
-          .setStmtHandle(schemaResp.getOperationHandle)
-          .build()
-        f(rs)
-      } finally {
-        rs.close()
-        connection.close()
-        transport.close()
-        rawTransport.close()
+    def checkResult(rs: ResultSet, dbNames: Seq[String]): Unit = {
+      for (i <- dbNames.indices) {
+        assert(rs.next())
+        assert(rs.getString("TABLE_SCHEM") === dbNames(i))
       }
-    }
-
-    def checkResult(dbNames: Seq[String], rs: HiveQueryResultSet): Unit = {
-      if (dbNames.nonEmpty) {
-        for (i <- dbNames.indices) {
-          assert(rs.next())
-          assert(rs.getString("TABLE_SCHEM") === dbNames(i))
-        }
-      } else {
-        assert(!rs.next())
-      }
+      // Make sure there are no more elements
+      assert(!rs.next())
     }
 
     withDatabase("db1", "db2") { statement =>
       Seq("CREATE DATABASE db1", "CREATE DATABASE db2").foreach(statement.execute)
 
-      testGetSchemasOperation(null, "%") { rs =>
-        checkResult(Seq("db1", "db2"), rs)
-      }
-      testGetSchemasOperation(null, "db1") { rs =>
-        checkResult(Seq("db1"), rs)
-      }
-      testGetSchemasOperation(null, "db_not_exist") { rs =>
-        checkResult(Seq.empty, rs)
-      }
-      testGetSchemasOperation(null, "db*") { rs =>
-        checkResult(Seq("db1", "db2"), rs)
-      }
+      val metaData = statement.getConnection.getMetaData
+
+      checkResult(metaData.getSchemas(null, "%"), Seq("db1", "db2", "default", "global_temp"))
+      checkResult(metaData.getSchemas(null, "db1"), Seq("db1"))
+      checkResult(metaData.getSchemas(null, "db_not_exist"), Seq.empty)
+      checkResult(metaData.getSchemas(null, "db*"), Seq("db1", "db2"))
     }
   }
 
   test("Spark's own GetTablesOperation(SparkGetTablesOperation)") {
-    def testGetTablesOperation(
-        schema: String,
-        tableNamePattern: String,
-        tableTypes: JList[String])(f: HiveQueryResultSet => Unit): Unit = {
-      val rawTransport = new TSocket("localhost", serverPort)
-      val connection = new HiveConnection(s"jdbc:hive2://localhost:$serverPort", new Properties)
-      val user = System.getProperty("user.name")
-      val transport = PlainSaslHelper.getPlainTransport(user, "anonymous", rawTransport)
-      val client = new TCLIService.Client(new TBinaryProtocol(transport))
-      transport.open()
-
-      var rs: HiveQueryResultSet = null
-
-      try {
-        val openResp = client.OpenSession(new TOpenSessionReq)
-        val sessHandle = openResp.getSessionHandle
-
-        val getTableReq = new TGetTablesReq(sessHandle)
-        getTableReq.setSchemaName(schema)
-        getTableReq.setTableName(tableNamePattern)
-        getTableReq.setTableTypes(tableTypes)
-
-        val getTableResp = client.GetTables(getTableReq)
-
-        JdbcUtils.verifySuccess(getTableResp.getStatus)
-
-        rs = new HiveQueryResultSet.Builder(connection)
-          .setClient(client)
-          .setSessionHandle(sessHandle)
-          .setStmtHandle(getTableResp.getOperationHandle)
-          .build()
-
-        f(rs)
-      } finally {
-        rs.close()
-        connection.close()
-        transport.close()
-        rawTransport.close()
+    def checkResult(rs: ResultSet, tableNames: Seq[String]): Unit = {
+      for (i <- tableNames.indices) {
+        assert(rs.next())
+        assert(rs.getString("TABLE_NAME") === tableNames(i))
       }
+      // Make sure there are no more elements
+      assert(!rs.next())
     }
 
-    def checkResult(tableNames: Seq[String], rs: HiveQueryResultSet): Unit = {
-      if (tableNames.nonEmpty) {
-        for (i <- tableNames.indices) {
-          assert(rs.next())
-          assert(rs.getString("TABLE_NAME") === tableNames(i))
-        }
-      } else {
-        assert(!rs.next())
-      }
-    }
-
-    withJdbcStatement("table1", "table2") { statement =>
+    withJdbcStatement("table1", "table2", "view1") { statement =>
       Seq(
         "CREATE TABLE table1(key INT, val STRING)",
         "CREATE TABLE table2(key INT, val STRING)",
-        "CREATE VIEW view1 AS SELECT * FROM table2").foreach(statement.execute)
+        "CREATE VIEW view1 AS SELECT * FROM table2",
+        "CREATE OR REPLACE GLOBAL TEMPORARY VIEW view_global_temp_1 AS SELECT 1 AS col1",
+        "CREATE OR REPLACE TEMPORARY VIEW view_temp_1 AS SELECT 1 as col1"
+      ).foreach(statement.execute)
 
-      testGetTablesOperation("%", "%", null) { rs =>
-        checkResult(Seq("table1", "table2", "view1"), rs)
+      val metaData = statement.getConnection.getMetaData
+
+      checkResult(metaData.getTables(null, "%", "%", null),
+        Seq("table1", "table2", "view1", "view_global_temp_1", "view_temp_1"))
+
+      checkResult(metaData.getTables(null, "%", "table1", null), Seq("table1"))
+
+      checkResult(metaData.getTables(null, "%", "table_not_exist", null), Seq.empty)
+
+      checkResult(metaData.getTables(null, "%", "%", Array("TABLE")),
+        Seq("table1", "table2"))
+
+      checkResult(metaData.getTables(null, "%", "%", Array("VIEW")),
+        Seq("view1", "view_global_temp_1", "view_temp_1"))
+
+      checkResult(metaData.getTables(null, "%", "view_global_temp_1", null),
+        Seq("view_global_temp_1"))
+
+      checkResult(metaData.getTables(null, "%", "view_temp_1", null),
+        Seq("view_temp_1"))
+
+      checkResult(metaData.getTables(null, "%", "%", Array("TABLE", "VIEW")),
+        Seq("table1", "table2", "view1", "view_global_temp_1", "view_temp_1"))
+
+      checkResult(metaData.getTables(null, "%", "table_not_exist", Array("TABLE", "VIEW")),
+        Seq.empty)
+    }
+  }
+
+  test("Spark's own GetColumnsOperation(SparkGetColumnsOperation)") {
+    def checkResult(
+        rs: ResultSet,
+        columns: Seq[(String, String, String, String, String)]) : Unit = {
+      for (i <- columns.indices) {
+        assert(rs.next())
+        val col = columns(i)
+        assert(rs.getString("TABLE_NAME") === col._1)
+        assert(rs.getString("COLUMN_NAME") === col._2)
+        assert(rs.getString("DATA_TYPE") === col._3)
+        assert(rs.getString("TYPE_NAME") === col._4)
+        assert(rs.getString("REMARKS") === col._5)
+      }
+      // Make sure there are no more elements
+      assert(!rs.next())
+    }
+
+    withJdbcStatement("table1", "table2", "view1") { statement =>
+      Seq(
+        "CREATE TABLE table1(key INT comment 'Int column', val STRING comment 'String column')",
+        "CREATE TABLE table2(key INT, val DECIMAL comment 'Decimal column')",
+        "CREATE VIEW view1 AS SELECT key FROM table1",
+        "CREATE OR REPLACE GLOBAL TEMPORARY VIEW view_global_temp_1 AS SELECT 2 AS col2",
+        "CREATE OR REPLACE TEMPORARY VIEW view_temp_1 AS SELECT 2 as col2"
+      ).foreach(statement.execute)
+
+      val metaData = statement.getConnection.getMetaData
+
+      checkResult(metaData.getColumns(null, "%", "%", null),
+        Seq(
+          ("table1", "key", "4", "INT", "Int column"),
+          ("table1", "val", "12", "STRING", "String column"),
+          ("table2", "key", "4", "INT", ""),
+          ("table2", "val", "3", "DECIMAL(10,0)", "Decimal column"),
+          ("view1", "key", "4", "INT", "Int column"),
+          ("view_global_temp_1", "col2", "4", "INT", ""),
+          ("view_temp_1", "col2", "4", "INT", "")))
+
+      checkResult(metaData.getColumns(null, "%", "table1", null),
+        Seq(
+          ("table1", "key", "4", "INT", "Int column"),
+          ("table1", "val", "12", "STRING", "String column")))
+
+      checkResult(metaData.getColumns(null, "%", "table1", "key"),
+        Seq(("table1", "key", "4", "INT", "Int column")))
+
+      checkResult(metaData.getColumns(null, "%", "view%", null),
+        Seq(
+          ("view1", "key", "4", "INT", "Int column"),
+          ("view_global_temp_1", "col2", "4", "INT", ""),
+          ("view_temp_1", "col2", "4", "INT", "")))
+
+      checkResult(metaData.getColumns(null, "%", "view_global_temp_1", null),
+        Seq(("view_global_temp_1", "col2", "4", "INT", "")))
+
+      checkResult(metaData.getColumns(null, "%", "view_temp_1", null),
+        Seq(("view_temp_1", "col2", "4", "INT", "")))
+
+      checkResult(metaData.getColumns(null, "%", "view_temp_1", "col2"),
+        Seq(("view_temp_1", "col2", "4", "INT", "")))
+
+      checkResult(metaData.getColumns(null, "default", "%", null),
+        Seq(
+          ("table1", "key", "4", "INT", "Int column"),
+          ("table1", "val", "12", "STRING", "String column"),
+          ("table2", "key", "4", "INT", ""),
+          ("table2", "val", "3", "DECIMAL(10,0)", "Decimal column"),
+          ("view1", "key", "4", "INT", "Int column"),
+          ("view_temp_1", "col2", "4", "INT", "")))
+
+      checkResult(metaData.getColumns(null, "%", "table_not_exist", null), Seq.empty)
+    }
+  }
+
+  test("Spark's own GetTableTypesOperation(SparkGetTableTypesOperation)") {
+    def checkResult(rs: ResultSet, tableTypes: Seq[String]): Unit = {
+      for (i <- tableTypes.indices) {
+        assert(rs.next())
+        assert(rs.getString("TABLE_TYPE") === tableTypes(i))
+      }
+      // Make sure there are no more elements
+      assert(!rs.next())
+    }
+
+    withJdbcStatement() { statement =>
+      val metaData = statement.getConnection.getMetaData
+      checkResult(metaData.getTableTypes, Seq("TABLE", "VIEW"))
+    }
+  }
+
+  test("Spark's own GetFunctionsOperation(SparkGetFunctionsOperation)") {
+    def checkResult(rs: ResultSet, functionNames: Seq[String]): Unit = {
+      functionNames.foreach { func =>
+        val exprInfo = FunctionRegistry.expressions(func)._1
+        assert(rs.next())
+        assert(rs.getString("FUNCTION_SCHEM") === "default")
+        assert(rs.getString("FUNCTION_NAME") === exprInfo.getName)
+        assert(rs.getString("REMARKS") ===
+          s"Usage: ${exprInfo.getUsage}\nExtended Usage:${exprInfo.getExtended}")
+        assert(rs.getInt("FUNCTION_TYPE") === DatabaseMetaData.functionResultUnknown)
+        assert(rs.getString("SPECIFIC_NAME") === exprInfo.getClassName)
+      }
+      // Make sure there are no more elements
+      assert(!rs.next())
+    }
+
+    withJdbcStatement() { statement =>
+      val metaData = statement.getConnection.getMetaData
+      // Hive does not have an overlay function, we use overlay to test.
+      checkResult(metaData.getFunctions(null, null, "overlay"), Seq("overlay"))
+      checkResult(metaData.getFunctions(null, null, "overla*"), Seq("overlay"))
+      checkResult(metaData.getFunctions(null, "", "overla*"), Seq("overlay"))
+      checkResult(metaData.getFunctions(null, null, "does-not-exist*"), Seq.empty)
+      checkResult(metaData.getFunctions(null, "default", "overlay"), Seq("overlay"))
+      checkResult(metaData.getFunctions(null, "default", "shift*"),
+        Seq("shiftleft", "shiftright", "shiftrightunsigned"))
+      checkResult(metaData.getFunctions(null, "default", "upPer"), Seq("upper"))
+    }
+  }
+
+  test("Spark's own GetCatalogsOperation(SparkGetCatalogsOperation)") {
+    withJdbcStatement() { statement =>
+      val metaData = statement.getConnection.getMetaData
+      val rs = metaData.getCatalogs
+      assert(!rs.next())
+    }
+  }
+
+  test("GetTypeInfo Thrift API") {
+    def checkResult(rs: ResultSet, typeNames: Seq[String]): Unit = {
+      for (i <- typeNames.indices) {
+        assert(rs.next())
+        assert(rs.getString("TYPE_NAME") === typeNames(i))
+      }
+      // Make sure there are no more elements
+      assert(!rs.next())
+    }
+
+    withJdbcStatement() { statement =>
+      val metaData = statement.getConnection.getMetaData
+      checkResult(metaData.getTypeInfo, ThriftserverShimUtils.supportedType().map(_.getName))
+    }
+  }
+
+  test("check results from get columns operation from thrift server") {
+    val schemaName = "default"
+    val tableName = "spark_get_col_operation"
+    val schema = new StructType()
+      .add("c0", "boolean", nullable = false, "0")
+      .add("c1", "tinyint", nullable = true, "1")
+      .add("c2", "smallint", nullable = false, "2")
+      .add("c3", "int", nullable = true, "3")
+      .add("c4", "long", nullable = false, "4")
+      .add("c5", "float", nullable = true, "5")
+      .add("c6", "double", nullable = false, "6")
+      .add("c7", "decimal(38, 20)", nullable = true, "7")
+      .add("c8", "decimal(10, 2)", nullable = false, "8")
+      .add("c9", "string", nullable = true, "9")
+      .add("c10", "array<long>", nullable = false, "10")
+      .add("c11", "array<string>", nullable = true, "11")
+      .add("c12", "map<smallint, tinyint>", nullable = false, "12")
+      .add("c13", "date", nullable = true, "13")
+      .add("c14", "timestamp", nullable = false, "14")
+      .add("c15", "struct<X: bigint,Y: double>", nullable = true, "15")
+      .add("c16", "binary", nullable = false, "16")
+
+    val ddl =
+      s"""
+         |CREATE TABLE $schemaName.$tableName (
+         |  ${schema.toDDL}
+         |)
+         |using parquet""".stripMargin
+
+    withJdbcStatement(tableName) { statement =>
+      statement.execute(ddl)
+
+      val databaseMetaData = statement.getConnection.getMetaData
+      val rowSet = databaseMetaData.getColumns("", schemaName, tableName, null)
+
+      import java.sql.Types._
+      val expectedJavaTypes = Seq(BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE,
+        DECIMAL, DECIMAL, VARCHAR, ARRAY, ARRAY, JAVA_OBJECT, DATE, TIMESTAMP, STRUCT, BINARY)
+
+      var pos = 0
+
+      while (rowSet.next()) {
+        assert(rowSet.getString("TABLE_CAT") === null)
+        assert(rowSet.getString("TABLE_SCHEM") === schemaName)
+        assert(rowSet.getString("TABLE_NAME") === tableName)
+        assert(rowSet.getString("COLUMN_NAME") === schema(pos).name)
+        assert(rowSet.getInt("DATA_TYPE") === expectedJavaTypes(pos))
+        assert(rowSet.getString("TYPE_NAME") === schema(pos).dataType.sql)
+
+        val colSize = rowSet.getInt("COLUMN_SIZE")
+        schema(pos).dataType match {
+          case StringType | BinaryType | _: ArrayType | _: MapType => assert(colSize === 0)
+          case o => assert(colSize === o.defaultSize)
+        }
+
+        assert(rowSet.getInt("BUFFER_LENGTH") === 0) // not used
+        val decimalDigits = rowSet.getInt("DECIMAL_DIGITS")
+        schema(pos).dataType match {
+          case BooleanType | _: IntegerType => assert(decimalDigits === 0)
+          case d: DecimalType => assert(decimalDigits === d.scale)
+          case FloatType => assert(decimalDigits === 7)
+          case DoubleType => assert(decimalDigits === 15)
+          case TimestampType => assert(decimalDigits === 6)
+          case _ => assert(decimalDigits === 0) // nulls
+        }
+
+        val radix = rowSet.getInt("NUM_PREC_RADIX")
+        schema(pos).dataType match {
+          case _: NumericType => assert(radix === 10)
+          case _ => assert(radix === 0) // nulls
+        }
+
+        assert(rowSet.getInt("NULLABLE") === 1)
+        assert(rowSet.getString("REMARKS") === pos.toString)
+        assert(rowSet.getInt("ORDINAL_POSITION") === pos)
+        assert(rowSet.getString("IS_NULLABLE") === "YES")
+        assert(rowSet.getString("IS_AUTO_INCREMENT") === "NO")
+        pos += 1
       }
 
-      testGetTablesOperation("%", "table1", null) { rs =>
-        checkResult(Seq("table1"), rs)
-      }
+      assert(pos === 17, "all columns should have been verified")
+    }
+  }
 
-      testGetTablesOperation("%", "table_not_exist", null) { rs =>
-        checkResult(Seq.empty, rs)
-      }
+  test("get columns operation should handle interval column properly") {
+    val viewName = "view_interval"
+    val ddl = s"CREATE GLOBAL TEMP VIEW $viewName as select interval 1 day as i"
 
-      testGetTablesOperation("%", "%", JArrays.asList("TABLE")) { rs =>
-        checkResult(Seq("table1", "table2"), rs)
-      }
-
-      testGetTablesOperation("%", "%", JArrays.asList("VIEW")) { rs =>
-        checkResult(Seq("view1"), rs)
-      }
-
-      testGetTablesOperation("%", "%", JArrays.asList("TABLE", "VIEW")) { rs =>
-        checkResult(Seq("table1", "table2", "view1"), rs)
+    withJdbcStatement(viewName) { statement =>
+      statement.execute(ddl)
+      val data = statement.getConnection.getMetaData
+      val rowSet = data.getColumns("", "global_temp", viewName, null)
+      while (rowSet.next()) {
+        assert(rowSet.getString("TABLE_CAT") === null)
+        assert(rowSet.getString("TABLE_SCHEM") === "global_temp")
+        assert(rowSet.getString("TABLE_NAME") === viewName)
+        assert(rowSet.getString("COLUMN_NAME") === "i")
+        assert(rowSet.getInt("DATA_TYPE") === java.sql.Types.OTHER)
+        assert(rowSet.getString("TYPE_NAME").equalsIgnoreCase(CalendarIntervalType.sql))
+        assert(rowSet.getInt("COLUMN_SIZE") === CalendarIntervalType.defaultSize)
+        assert(rowSet.getInt("DECIMAL_DIGITS") === 0)
+        assert(rowSet.getInt("NUM_PREC_RADIX") === 0)
+        assert(rowSet.getInt("NULLABLE") === 0)
+        assert(rowSet.getString("REMARKS") === "")
+        assert(rowSet.getInt("ORDINAL_POSITION") === 0)
+        assert(rowSet.getString("IS_NULLABLE") === "YES")
+        assert(rowSet.getString("IS_AUTO_INCREMENT") === "NO")
       }
     }
   }

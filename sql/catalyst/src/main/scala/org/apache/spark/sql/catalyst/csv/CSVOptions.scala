@@ -26,6 +26,7 @@ import com.univocity.parsers.csv.{CsvParserSettings, CsvWriterSettings, Unescape
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
 
 class CSVOptions(
     @transient val parameters: CaseInsensitiveMap[String],
@@ -95,7 +96,7 @@ class CSVOptions(
     }
   }
 
-  val delimiter = CSVExprUtils.toChar(
+  val delimiter = CSVExprUtils.toDelimiterStr(
     parameters.getOrElse("sep", parameters.getOrElse("delimiter", ",")))
   val parseMode: ParseMode =
     parameters.get("mode").map(ParseMode.fromString).getOrElse(PermissiveMode)
@@ -146,10 +147,14 @@ class CSVOptions(
   // A language tag in IETF BCP 47 format
   val locale: Locale = parameters.get("locale").map(Locale.forLanguageTag).getOrElse(Locale.US)
 
-  val dateFormat: String = parameters.getOrElse("dateFormat", "yyyy-MM-dd")
+  val dateFormat: String = parameters.getOrElse("dateFormat", DateFormatter.defaultPattern)
 
-  val timestampFormat: String =
-    parameters.getOrElse("timestampFormat", "yyyy-MM-dd'T'HH:mm:ss.SSSXXX")
+  val timestampFormat: String = parameters.getOrElse("timestampFormat",
+    if (SQLConf.get.legacyTimeParserPolicy == LegacyBehaviorPolicy.LEGACY) {
+      s"${DateFormatter.defaultPattern}'T'HH:mm:ss.SSSXXX"
+    } else {
+      s"${DateFormatter.defaultPattern}'T'HH:mm:ss[.SSS][XXX]"
+    })
 
   val multiLine = parameters.get("multiLine").map(_.toBoolean).getOrElse(false)
 
@@ -162,6 +167,11 @@ class CSVOptions(
   val quoteAll = getBool("quoteAll", false)
 
   val inputBufferSize = 128
+
+  /**
+   * The max error content length in CSV parser/writer exception message.
+   */
+  val maxErrorContentLength = 1000
 
   val isCommentSet = this.comment != '\u0000'
 
@@ -210,7 +220,9 @@ class CSVOptions(
     format.setQuote(quote)
     format.setQuoteEscape(escape)
     charToEscapeQuoteEscaping.foreach(format.setCharToEscapeQuoteEscaping)
-    format.setComment(comment)
+    if (isCommentSet) {
+      format.setComment(comment)
+    }
     lineSeparatorInWrite.foreach(format.setLineSeparator)
 
     writerSettings.setIgnoreLeadingWhitespaces(ignoreLeadingWhiteSpaceFlagInWrite)
@@ -220,6 +232,7 @@ class CSVOptions(
     writerSettings.setSkipEmptyLines(true)
     writerSettings.setQuoteAllFields(quoteAll)
     writerSettings.setQuoteEscapingEnabled(escapeQuotes)
+    writerSettings.setErrorContentLength(maxErrorContentLength)
     writerSettings
   }
 
@@ -231,7 +244,11 @@ class CSVOptions(
     format.setQuoteEscape(escape)
     lineSeparator.foreach(format.setLineSeparator)
     charToEscapeQuoteEscaping.foreach(format.setCharToEscapeQuoteEscaping)
-    format.setComment(comment)
+    if (isCommentSet) {
+      format.setComment(comment)
+    } else {
+      settings.setCommentProcessingEnabled(false)
+    }
 
     settings.setIgnoreLeadingWhitespaces(ignoreLeadingWhiteSpaceInRead)
     settings.setIgnoreTrailingWhitespaces(ignoreTrailingWhiteSpaceInRead)
@@ -246,6 +263,7 @@ class CSVOptions(
     lineSeparatorInRead.foreach { _ =>
       settings.setNormalizeLineEndingsWithinQuotes(!multiLine)
     }
+    settings.setErrorContentLength(maxErrorContentLength)
 
     settings
   }

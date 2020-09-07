@@ -24,10 +24,11 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable.HashMap
 
 import org.apache.spark._
-import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.CPUS_PER_TASK
 import org.apache.spark.internal.config.Status._
+import org.apache.spark.resource.ResourceProfile.CPUS
 import org.apache.spark.scheduler._
 import org.apache.spark.status.api.v1
 import org.apache.spark.storage._
@@ -51,7 +52,7 @@ private[spark] class AppStatusListener(
   private var sparkVersion = SPARK_VERSION
   private var appInfo: v1.ApplicationInfo = null
   private var appSummary = new AppSummary(0, 0)
-  private var coresPerTask: Int = 1
+  private var defaultCpusPerTask: Int = 1
 
   // How often to update live entities. -1 means "never update" when replaying applications,
   // meaning only the last write will happen. For live applications, this avoids a few
@@ -71,11 +72,12 @@ private[spark] class AppStatusListener(
   // causing too many writes to the underlying store, and other expensive operations).
   private val liveStages = new ConcurrentHashMap[(Int, Int), LiveStage]()
   private val liveJobs = new HashMap[Int, LiveJob]()
-  private val liveExecutors = new HashMap[String, LiveExecutor]()
+  private[spark] val liveExecutors = new HashMap[String, LiveExecutor]()
   private val deadExecutors = new HashMap[String, LiveExecutor]()
   private val liveTasks = new HashMap[Long, LiveTask]()
   private val liveRDDs = new HashMap[Int, LiveRDD]()
   private val pools = new HashMap[String, SchedulerPool]()
+  private val liveResourceProfiles = new HashMap[Int, LiveResourceProfile]()
 
   private val SQL_EXECUTION_ID_KEY = "spark.sql.execution.id"
   // Keep the active executor count as a separate variable to avoid having to do synchronization
@@ -145,6 +147,20 @@ private[spark] class AppStatusListener(
     }
   }
 
+  override def onResourceProfileAdded(event: SparkListenerResourceProfileAdded): Unit = {
+    val maxTasks = if (event.resourceProfile.isCoresLimitKnown) {
+      Some(event.resourceProfile.maxTasksPerExecutor(conf))
+    } else {
+      None
+    }
+    val liveRP = new LiveResourceProfile(event.resourceProfile.id,
+      event.resourceProfile.executorResources, event.resourceProfile.taskResources, maxTasks)
+    liveResourceProfiles(event.resourceProfile.id) = liveRP
+    val rpInfo = new v1.ResourceProfileInfo(liveRP.resourceProfileId,
+      liveRP.executorResources, liveRP.taskResources)
+    kvstore.write(new ResourceProfileWrapper(rpInfo))
+  }
+
   override def onEnvironmentUpdate(event: SparkListenerEnvironmentUpdate): Unit = {
     val details = event.environmentDetails
 
@@ -159,10 +175,11 @@ private[spark] class AppStatusListener(
       details.getOrElse("Spark Properties", Nil),
       details.getOrElse("Hadoop Properties", Nil),
       details.getOrElse("System Properties", Nil),
-      details.getOrElse("Classpath Entries", Nil))
+      details.getOrElse("Classpath Entries", Nil),
+      Nil)
 
-    coresPerTask = envInfo.sparkProperties.toMap.get(CPUS_PER_TASK.key).map(_.toInt)
-      .getOrElse(coresPerTask)
+    defaultCpusPerTask = envInfo.sparkProperties.toMap.get(CPUS_PER_TASK.key).map(_.toInt)
+      .getOrElse(defaultCpusPerTask)
 
     kvstore.write(new ApplicationEnvironmentInfoWrapper(envInfo))
   }
@@ -197,9 +214,16 @@ private[spark] class AppStatusListener(
     exec.host = event.executorInfo.executorHost
     exec.isActive = true
     exec.totalCores = event.executorInfo.totalCores
-    exec.maxTasks = event.executorInfo.totalCores / coresPerTask
+    val rpId = event.executorInfo.resourceProfileId
+    val liveRP = liveResourceProfiles.get(rpId)
+    val cpusPerTask = liveRP.flatMap(_.taskResources.get(CPUS))
+      .map(_.amount.toInt).getOrElse(defaultCpusPerTask)
+    val maxTasksPerExec = liveRP.flatMap(_.maxTasksPerExecutor)
+    exec.maxTasks = maxTasksPerExec.getOrElse(event.executorInfo.totalCores / cpusPerTask)
     exec.executorLogs = event.executorInfo.logUrlMap
+    exec.resources = event.executorInfo.resourcesInfo
     exec.attributes = event.executorInfo.attributes
+    exec.resourceProfileId = rpId
     liveUpdate(exec, System.nanoTime())
   }
 
@@ -233,8 +257,8 @@ private[spark] class AppStatusListener(
                 (partition.memoryUsed / partition.executors.length) * -1)
               rdd.diskUsed = addDeltaToValue(rdd.diskUsed,
                 (partition.diskUsed / partition.executors.length) * -1)
-              partition.update(partition.executors
-                .filter(!_.equals(event.executorId)), rdd.storageLevel,
+              partition.update(
+                partition.executors.filter(!_.equals(event.executorId)),
                 addDeltaToValue(partition.memoryUsed,
                   (partition.memoryUsed / partition.executors.length) * -1),
                 addDeltaToValue(partition.diskUsed,
@@ -354,6 +378,8 @@ private[spark] class AppStatusListener(
 
     val lastStageInfo = event.stageInfos.sortBy(_.stageId).lastOption
     val jobName = lastStageInfo.map(_.name).getOrElse("")
+    val description = Option(event.properties)
+      .flatMap { p => Option(p.getProperty(SparkContext.SPARK_JOB_DESCRIPTION)) }
     val jobGroup = Option(event.properties)
       .flatMap { p => Option(p.getProperty(SparkContext.SPARK_JOB_GROUP_ID)) }
     val sqlExecutionId = Option(event.properties)
@@ -362,6 +388,7 @@ private[spark] class AppStatusListener(
     val job = new LiveJob(
       event.jobId,
       jobName,
+      description,
       if (event.time > 0) Some(new Date(event.time)) else None,
       event.stageIds,
       jobGroup,
@@ -494,7 +521,7 @@ private[spark] class AppStatusListener(
 
     event.stageInfo.rddInfos.foreach { info =>
       if (info.storageLevel.isValid) {
-        liveUpdate(liveRDDs.getOrElseUpdate(info.id, new LiveRDD(info)), now)
+        liveUpdate(liveRDDs.getOrElseUpdate(info.id, new LiveRDD(info, info.storageLevel)), now)
       }
     }
 
@@ -768,6 +795,11 @@ private[spark] class AppStatusListener(
     event.maxOnHeapMem.foreach { _ =>
       exec.totalOnHeap = event.maxOnHeapMem.get
       exec.totalOffHeap = event.maxOffHeapMem.get
+      // SPARK-30594: whenever(first time or re-register) a BlockManager added, all blocks
+      // from this BlockManager will be reported to driver later. So, we should clean up
+      // used memory to avoid overlapped count.
+      exec.usedOnHeap = 0
+      exec.usedOffHeap = 0
     }
     exec.isActive = true
     exec.maxMemory = event.maxMem
@@ -836,13 +868,17 @@ private[spark] class AppStatusListener(
     // check if there is a new peak value for any of the executor level memory metrics
     // for the live UI. SparkListenerExecutorMetricsUpdate events are only processed
     // for the live UI.
-    event.executorUpdates.foreach { updates =>
+    event.executorUpdates.foreach { case (key, peakUpdates) =>
       liveExecutors.get(event.execId).foreach { exec =>
-        if (exec.peakExecutorMetrics.compareAndUpdatePeakValues(updates)) {
-          maybeUpdate(exec, now)
+        if (exec.peakExecutorMetrics.compareAndUpdatePeakValues(peakUpdates)) {
+          update(exec, now)
         }
       }
+
+      // Update stage level peak executor metrics.
+      updateStageLevelPeakExecutorMetrics(key._1, key._2, event.execId, peakUpdates, now)
     }
+
     // Flush updates if necessary. Executor heartbeat is an event that happens periodically. Flush
     // here to ensure the staleness of Spark UI doesn't last more than
     // `max(heartbeat interval, liveUpdateMinFlushPeriod)`.
@@ -853,17 +889,38 @@ private[spark] class AppStatusListener(
     }
   }
 
-  override def onStageExecutorMetrics(executorMetrics: SparkListenerStageExecutorMetrics): Unit = {
+  override def onStageExecutorMetrics(event: SparkListenerStageExecutorMetrics): Unit = {
     val now = System.nanoTime()
 
     // check if there is a new peak value for any of the executor level memory metrics,
     // while reading from the log. SparkListenerStageExecutorMetrics are only processed
     // when reading logs.
-    liveExecutors.get(executorMetrics.execId).orElse(
-      deadExecutors.get(executorMetrics.execId)).foreach { exec =>
-        if (exec.peakExecutorMetrics.compareAndUpdatePeakValues(executorMetrics.executorMetrics)) {
-          update(exec, now)
-        }
+    liveExecutors.get(event.execId).orElse(
+      deadExecutors.get(event.execId)).foreach { exec =>
+      if (exec.peakExecutorMetrics.compareAndUpdatePeakValues(event.executorMetrics)) {
+        update(exec, now)
+      }
+    }
+
+    // Update stage level peak executor metrics.
+    updateStageLevelPeakExecutorMetrics(
+      event.stageId, event.stageAttemptId, event.execId, event.executorMetrics, now)
+  }
+
+  private def updateStageLevelPeakExecutorMetrics(
+      stageId: Int,
+      stageAttemptId: Int,
+      executorId: String,
+      executorMetrics: ExecutorMetrics,
+      now: Long): Unit = {
+    Option(liveStages.get((stageId, stageAttemptId))).foreach { stage =>
+      if (stage.peakExecutorMetrics.compareAndUpdatePeakValues(executorMetrics)) {
+        update(stage, now)
+      }
+      val esummary = stage.executorSummary(executorId)
+      if (esummary.peakExecutorMetrics.compareAndUpdatePeakValues(executorMetrics)) {
+        update(esummary, now)
+      }
     }
   }
 
@@ -915,12 +972,6 @@ private[spark] class AppStatusListener(
     val diskDelta = event.blockUpdatedInfo.diskSize * (if (storageLevel.useDisk) 1 else -1)
     val memoryDelta = event.blockUpdatedInfo.memSize * (if (storageLevel.useMemory) 1 else -1)
 
-    val updatedStorageLevel = if (storageLevel.isValid) {
-      Some(storageLevel.description)
-    } else {
-      None
-    }
-
     // We need information about the executor to update some memory accounting values in the
     // RDD info, so read that beforehand.
     val maybeExec = liveExecutors.get(executorId)
@@ -935,13 +986,9 @@ private[spark] class AppStatusListener(
     // Update the block entry in the RDD info, keeping track of the deltas above so that we
     // can update the executor information too.
     liveRDDs.get(block.rddId).foreach { rdd =>
-      if (updatedStorageLevel.isDefined) {
-        rdd.setStorageLevel(updatedStorageLevel.get)
-      }
-
       val partition = rdd.partition(block.name)
 
-      val executors = if (updatedStorageLevel.isDefined) {
+      val executors = if (storageLevel.isValid) {
         val current = partition.executors
         if (current.contains(executorId)) {
           current
@@ -956,7 +1003,7 @@ private[spark] class AppStatusListener(
 
       // Only update the partition if it's still stored in some executor, otherwise get rid of it.
       if (executors.nonEmpty) {
-        partition.update(executors, rdd.storageLevel,
+        partition.update(executors,
           addDeltaToValue(partition.memoryUsed, memoryDelta),
           addDeltaToValue(partition.diskUsed, diskDelta))
       } else {
@@ -1048,7 +1095,7 @@ private[spark] class AppStatusListener(
     }
   }
 
-  private def updateExecutorMemoryDiskInfo(
+  private[spark] def updateExecutorMemoryDiskInfo(
       exec: LiveExecutor,
       storageLevel: StorageLevel,
       memoryDelta: Long,

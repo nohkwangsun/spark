@@ -29,7 +29,7 @@ class KryoSerializerDistributedSuite extends SparkFunSuite with LocalSparkContex
   test("kryo objects are serialised consistently in different processes") {
     val conf = new SparkConf(false)
       .set(config.SERIALIZER, "org.apache.spark.serializer.KryoSerializer")
-      .set(config.Kryo.KRYO_USER_REGISTRATORS, classOf[AppJarRegistrator].getName)
+      .set(config.Kryo.KRYO_USER_REGISTRATORS, Seq(classOf[AppJarRegistrator].getName))
       .set(config.TASK_MAX_FAILURES, 1)
       .set(config.BLACKLIST_ENABLED, false)
 
@@ -56,7 +56,7 @@ object KryoDistributedTest {
   class MyCustomClass
 
   class AppJarRegistrator extends KryoRegistrator {
-    override def registerClasses(k: Kryo) {
+    override def registerClasses(k: Kryo): Unit = {
       k.register(Utils.classForName(AppJarRegistrator.customClassName,
         noSparkClassLoader = true))
     }

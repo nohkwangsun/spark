@@ -21,5 +21,7 @@
   "addTime" : "2015-02-03T16:43:00.906GMT",
   "executorLogs" : { },
   "blacklistedInStages" : [ ],
-  "attributes" : { }
+  "attributes" : { },
+  "resources" : { },
+  "resourceProfileId" : 0
 } ]

@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.optimizer
 import scala.collection.mutable
 
 import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.catalog.{InMemoryCatalog, SessionCatalog}
 import org.apache.spark.sql.catalyst.expressions._
@@ -27,6 +28,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
@@ -35,7 +37,7 @@ import org.apache.spark.util.Utils
  * Abstract class all optimizers should inherit of, contains the standard batches (extending
  * Optimizers can override this.
  */
-abstract class Optimizer(sessionCatalog: SessionCatalog)
+abstract class Optimizer(catalogManager: CatalogManager)
   extends RuleExecutor[LogicalPlan] {
 
   // Check for structural integrity of the plan in test mode.
@@ -47,7 +49,15 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
       plan.find(PlanHelper.specialExpressionsInUnsupportedOperator(_).nonEmpty).isEmpty)
   }
 
-  protected def fixedPoint = FixedPoint(SQLConf.get.optimizerMaxIterations)
+  override protected val excludedOnceBatches: Set[String] =
+    Set(
+      "PartitionPruning",
+      "Extract Python UDFs")
+
+  protected def fixedPoint =
+    FixedPoint(
+      SQLConf.get.optimizerMaxIterations,
+      maxIterationsSetting = SQLConf.OPTIMIZER_MAX_ITERATIONS.key)
 
   /**
    * Defines the default rule batches in the Optimizer.
@@ -63,8 +73,7 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
         PushProjectionThroughUnion,
         ReorderJoin,
         EliminateOuterJoin,
-        PushPredicateThroughJoin,
-        PushDownPredicate,
+        PushDownPredicates,
         PushDownLeftSemiAntiJoin,
         PushLeftSemiLeftAntiThroughJoin,
         LimitPushDown,
@@ -84,6 +93,7 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
         FoldablePropagation,
         OptimizeIn,
         ConstantFolding,
+        EliminateAggregateFilter,
         ReorderAssociativeOperator,
         LikeSimplification,
         BooleanSimplification,
@@ -92,13 +102,13 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
         SimplifyBinaryComparison,
         ReplaceNullWithFalseInPredicate,
         PruneFilters,
-        EliminateSorts,
         SimplifyCasts,
         SimplifyCaseConversionExpressions,
         RewriteCorrelatedScalarSubquery,
         EliminateSerialization,
         RemoveRedundantAliases,
         RemoveNoopOperators,
+        CombineWithFields,
         SimplifyExtractValueOps,
         CombineConcats) ++
         extendedOperatorOptimizationRules
@@ -111,10 +121,15 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
       Batch("Infer Filters", Once,
         InferFiltersFromConstraints) ::
       Batch("Operator Optimization after Inferring Filters", fixedPoint,
-        rulesWithoutInferFiltersFromConstraints: _*) :: Nil
+        rulesWithoutInferFiltersFromConstraints: _*) ::
+      // Set strategy to Once to avoid pushing filter every time because we do not change the
+      // join condition.
+      Batch("Push extra predicate through join", fixedPoint,
+        PushExtraPredicateThroughJoin,
+        PushDownPredicates) :: Nil
     }
 
-    (Batch("Eliminate Distinct", Once, EliminateDistinct) ::
+    val batches = (Batch("Eliminate Distinct", Once, EliminateDistinct) ::
     // Technically some of the rules in Finish Analysis are not optimizer rules and belong more
     // in the analyzer, because they are needed for correctness (e.g. ComputeCurrentTime).
     // However, because we also use the analyzer to canonicalized queries (for view definition),
@@ -124,8 +139,9 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
       EliminateSubqueryAliases,
       EliminateView,
       ReplaceExpressions,
+      RewriteNonCorrelatedExists,
       ComputeCurrentTime,
-      GetCurrentDatabase(sessionCatalog),
+      GetCurrentDatabaseAndCatalog(catalogManager),
       RewriteDistinctAggregates,
       ReplaceDeduplicateWithAggregate) ::
     //////////////////////////////////////////////////////////////////////////////////////////
@@ -147,10 +163,15 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
     // LocalRelation and does not trigger many rules.
     Batch("LocalRelation early", fixedPoint,
       ConvertToLocalRelation,
-      PropagateEmptyRelation) ::
+      PropagateEmptyRelation,
+      // PropagateEmptyRelation can change the nullability of an attribute from nullable to
+      // non-nullable when an empty relation child of a Union is removed
+      UpdateAttributeNullability) ::
     Batch("Pullup Correlated Expressions", Once,
       PullupCorrelatedPredicates) ::
-    Batch("Subquery", Once,
+    // Subquery batch applies the optimizer rules recursively. Therefore, it makes no sense
+    // to enforce idempotence on it and we change this batch from Once to FixedPoint(1).
+    Batch("Subquery", FixedPoint(1),
       OptimizeSubqueries) ::
     Batch("Replace Operators", fixedPoint,
       RewriteExceptAll,
@@ -163,23 +184,30 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
       RemoveLiteralFromGroupExpressions,
       RemoveRepetitionFromGroupExpressions) :: Nil ++
     operatorOptimizationBatch) :+
-    Batch("Join Reorder", Once,
+    // This batch pushes filters and projections into scan nodes. Before this batch, the logical
+    // plan may contain nodes that do not report stats. Anything that uses stats must run after
+    // this batch.
+    Batch("Early Filter and Projection Push-Down", Once, earlyScanPushDownRules: _*) :+
+    // Since join costs in AQP can change between multiple runs, there is no reason that we have an
+    // idempotence enforcement on this batch. We thus make it FixedPoint(1) instead of Once.
+    Batch("Join Reorder", FixedPoint(1),
       CostBasedJoinReorder) :+
-    Batch("Remove Redundant Sorts", Once,
-      RemoveRedundantSorts) :+
+    Batch("Eliminate Sorts", Once,
+      EliminateSorts) :+
     Batch("Decimal Optimizations", fixedPoint,
       DecimalAggregates) :+
     Batch("Object Expressions Optimization", fixedPoint,
       EliminateMapObjects,
       CombineTypedFilters,
-      ObjectSerializerPruning) :+
+      ObjectSerializerPruning,
+      ReassignLambdaVariableID) :+
     Batch("LocalRelation", fixedPoint,
       ConvertToLocalRelation,
-      PropagateEmptyRelation) :+
-    Batch("Extract PythonUDF From JoinCondition", Once,
-      PullOutPythonUDFInJoinCondition) :+
-    // The following batch should be executed after batch "Join Reorder" "LocalRelation" and
-    // "Extract PythonUDF From JoinCondition".
+      PropagateEmptyRelation,
+      // PropagateEmptyRelation can change the nullability of an attribute from nullable to
+      // non-nullable when an empty relation child of a Union is removed
+      UpdateAttributeNullability) :+
+    // The following batch should be executed after batch "Join Reorder" and "LocalRelation".
     Batch("Check Cartesian Products", Once,
       CheckCartesianProducts) :+
     Batch("RewriteSubquery", Once,
@@ -188,7 +216,11 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
       CollapseProject,
       RemoveNoopOperators) :+
     // This batch must be executed after the `RewriteSubquery` batch, which creates joins.
-    Batch("NormalizeFloatingNumbers", Once, NormalizeFloatingNumbers)
+    Batch("NormalizeFloatingNumbers", Once, NormalizeFloatingNumbers) :+
+    Batch("ReplaceWithFieldsExpression", Once, ReplaceWithFieldsExpression)
+
+    // remove any batches with no rules. this may happen when subclasses do not add optional rules.
+    batches.filter(_.rules.nonEmpty)
   }
 
   /**
@@ -206,7 +238,7 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
       EliminateView.ruleName ::
       ReplaceExpressions.ruleName ::
       ComputeCurrentTime.ruleName ::
-      GetCurrentDatabase(sessionCatalog).ruleName ::
+      GetCurrentDatabaseAndCatalog(catalogManager).ruleName ::
       RewriteDistinctAggregates.ruleName ::
       ReplaceDeduplicateWithAggregate.ruleName ::
       ReplaceIntersectWithSemiJoin.ruleName ::
@@ -218,8 +250,8 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
       PullupCorrelatedPredicates.ruleName ::
       RewriteCorrelatedScalarSubquery.ruleName ::
       RewritePredicateSubquery.ruleName ::
-      PullOutPythonUDFInJoinCondition.ruleName ::
-      NormalizeFloatingNumbers.ruleName :: Nil
+      NormalizeFloatingNumbers.ruleName ::
+      ReplaceWithFieldsExpression.ruleName :: Nil
 
   /**
    * Optimize all the subqueries inside expression.
@@ -234,7 +266,7 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
     }
     def apply(plan: LogicalPlan): LogicalPlan = plan transformAllExpressions {
       case s: SubqueryExpression =>
-        val Subquery(newPlan) = Optimizer.this.execute(Subquery(s.plan))
+        val Subquery(newPlan, _) = Optimizer.this.execute(Subquery.fromExpression(s))
         // At this point we have an optimized subquery plan that we are going to attach
         // to this subquery expression. Here we can safely remove any top level sort
         // in the plan as tuples produced by a subquery are un-ordered.
@@ -246,6 +278,11 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
    * Override to provide additional rules for the operator optimization batch.
    */
   def extendedOperatorOptimizationRules: Seq[Rule[LogicalPlan]] = Nil
+
+  /**
+   * Override to provide additional rules for early projection and filter pushdown to scans.
+   */
+  def earlyScanPushDownRules: Seq[Rule[LogicalPlan]] = Nil
 
   /**
    * Returns (defaultBatches - (excludedRules - nonExcludableRules)), the rule batches that
@@ -305,6 +342,27 @@ object EliminateDistinct extends Rule[LogicalPlan] {
 }
 
 /**
+ * Remove useless FILTER clause for aggregate expressions.
+ * This rule should be applied before RewriteDistinctAggregates.
+ */
+object EliminateAggregateFilter extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan transformExpressions  {
+    case ae @ AggregateExpression(_, _, _, Some(Literal.TrueLiteral), _) =>
+      ae.copy(filter = None)
+    case AggregateExpression(af: DeclarativeAggregate, _, _, Some(Literal.FalseLiteral), _) =>
+      val initialProject = SafeProjection.create(af.initialValues)
+      val evalProject = SafeProjection.create(af.evaluateExpression :: Nil, af.aggBufferAttributes)
+      val initialBuffer = initialProject(EmptyRow)
+      val internalRow = evalProject(initialBuffer)
+      Literal.create(internalRow.get(0, af.dataType), af.dataType)
+    case AggregateExpression(af: ImperativeAggregate, _, _, Some(Literal.FalseLiteral), _) =>
+      val buffer = new SpecificInternalRow(af.aggBufferAttributes.map(_.dataType))
+      af.initialize(buffer)
+      Literal.create(af.eval(buffer), af.dataType)
+  }
+}
+
+/**
  * An optimizer used in test code.
  *
  * To ensure extendability, we leave the standard rules in the abstract optimizer rules, while
@@ -313,10 +371,10 @@ object EliminateDistinct extends Rule[LogicalPlan] {
 object SimpleTestOptimizer extends SimpleTestOptimizer
 
 class SimpleTestOptimizer extends Optimizer(
-  new SessionCatalog(
-    new InMemoryCatalog,
-    EmptyFunctionRegistry,
-    new SQLConf().copy(SQLConf.CASE_SENSITIVE -> true)))
+  new CatalogManager(
+    new SQLConf().copy(SQLConf.CASE_SENSITIVE -> true),
+    FakeV2SessionCatalog,
+    new SessionCatalog(new InMemoryCatalog, EmptyFunctionRegistry, new SQLConf())))
 
 /**
  * Remove redundant aliases from a query plan. A redundant alias is an alias that does not change
@@ -338,38 +396,38 @@ object RemoveRedundantAliases extends Rule[LogicalPlan] {
   /**
    * Remove the top-level alias from an expression when it is redundant.
    */
-  private def removeRedundantAlias(e: Expression, blacklist: AttributeSet): Expression = e match {
+  private def removeRedundantAlias(e: Expression, excludeList: AttributeSet): Expression = e match {
     // Alias with metadata can not be stripped, or the metadata will be lost.
     // If the alias name is different from attribute name, we can't strip it either, or we
     // may accidentally change the output schema name of the root plan.
     case a @ Alias(attr: Attribute, name)
       if a.metadata == Metadata.empty &&
         name == attr.name &&
-        !blacklist.contains(attr) &&
-        !blacklist.contains(a) =>
+        !excludeList.contains(attr) &&
+        !excludeList.contains(a) =>
       attr
     case a => a
   }
 
   /**
-   * Remove redundant alias expression from a LogicalPlan and its subtree. A blacklist is used to
-   * prevent the removal of seemingly redundant aliases used to deduplicate the input for a (self)
-   * join or to prevent the removal of top-level subquery attributes.
+   * Remove redundant alias expression from a LogicalPlan and its subtree. A set of excludes is used
+   * to prevent the removal of seemingly redundant aliases used to deduplicate the input for a
+   * (self) join or to prevent the removal of top-level subquery attributes.
    */
-  private def removeRedundantAliases(plan: LogicalPlan, blacklist: AttributeSet): LogicalPlan = {
+  private def removeRedundantAliases(plan: LogicalPlan, excluded: AttributeSet): LogicalPlan = {
     plan match {
       // We want to keep the same output attributes for subqueries. This means we cannot remove
       // the aliases that produce these attributes
-      case Subquery(child) =>
-        Subquery(removeRedundantAliases(child, blacklist ++ child.outputSet))
+      case Subquery(child, correlated) =>
+        Subquery(removeRedundantAliases(child, excluded ++ child.outputSet), correlated)
 
       // A join has to be treated differently, because the left and the right side of the join are
-      // not allowed to use the same attributes. We use a blacklist to prevent us from creating a
-      // situation in which this happens; the rule will only remove an alias if its child
+      // not allowed to use the same attributes. We use an exclude list to prevent us from creating
+      // a situation in which this happens; the rule will only remove an alias if its child
       // attribute is not on the black list.
       case Join(left, right, joinType, condition, hint) =>
-        val newLeft = removeRedundantAliases(left, blacklist ++ right.outputSet)
-        val newRight = removeRedundantAliases(right, blacklist ++ newLeft.outputSet)
+        val newLeft = removeRedundantAliases(left, excluded ++ right.outputSet)
+        val newRight = removeRedundantAliases(right, excluded ++ newLeft.outputSet)
         val mapping = AttributeMap(
           createAttributeMapping(left, newLeft) ++
           createAttributeMapping(right, newRight))
@@ -382,22 +440,22 @@ object RemoveRedundantAliases extends Rule[LogicalPlan] {
         // Remove redundant aliases in the subtree(s).
         val currentNextAttrPairs = mutable.Buffer.empty[(Attribute, Attribute)]
         val newNode = plan.mapChildren { child =>
-          val newChild = removeRedundantAliases(child, blacklist)
+          val newChild = removeRedundantAliases(child, excluded)
           currentNextAttrPairs ++= createAttributeMapping(child, newChild)
           newChild
         }
 
         // Create the attribute mapping. Note that the currentNextAttrPairs can contain duplicate
         // keys in case of Union (this is caused by the PushProjectionThroughUnion rule); in this
-        // case we use the the first mapping (which should be provided by the first child).
-        val mapping = AttributeMap(currentNextAttrPairs)
+        // case we use the first mapping (which should be provided by the first child).
+        val mapping = AttributeMap(currentNextAttrPairs.toSeq)
 
         // Create a an expression cleaning function for nodes that can actually produce redundant
         // aliases, use identity otherwise.
         val clean: Expression => Expression = plan match {
-          case _: Project => removeRedundantAlias(_, blacklist)
-          case _: Aggregate => removeRedundantAlias(_, blacklist)
-          case _: Window => removeRedundantAlias(_, blacklist)
+          case _: Project => removeRedundantAlias(_, excluded)
+          case _: Aggregate => removeRedundantAlias(_, excluded)
+          case _: Window => removeRedundantAlias(_, excluded)
           case _ => identity[Expression]
         }
 
@@ -462,8 +520,8 @@ object LimitPushDown extends Rule[LogicalPlan] {
     // Note: right now Union means UNION ALL, which does not de-duplicate rows, so it is safe to
     // pushdown Limit through it. Once we add UNION DISTINCT, however, we will not be able to
     // pushdown Limit.
-    case LocalLimit(exp, Union(children)) =>
-      LocalLimit(exp, Union(children.map(maybePushLocalLimit(exp, _))))
+    case LocalLimit(exp, u: Union) =>
+      LocalLimit(exp, u.copy(children = u.children.map(maybePushLocalLimit(exp, _))))
     // Add extra limits below OUTER JOIN. For LEFT OUTER and RIGHT OUTER JOIN we push limits to
     // the left and right sides, respectively. It's not safe to push limits below FULL OUTER
     // JOIN in the general case without a more invasive rewrite.
@@ -487,7 +545,7 @@ object LimitPushDown extends Rule[LogicalPlan] {
  * Union:
  * Right now, Union means UNION ALL, which does not de-duplicate rows. So, it is
  * safe to pushdown Filters and Projections through it. Filter pushdown is handled by another
- * rule PushDownPredicate. Once we add UNION DISTINCT, we will not be able to pushdown Projections.
+ * rule PushDownPredicates. Once we add UNION DISTINCT, we will not be able to pushdown Projections.
  */
 object PushProjectionThroughUnion extends Rule[LogicalPlan] with PredicateHelper {
 
@@ -521,15 +579,15 @@ object PushProjectionThroughUnion extends Rule[LogicalPlan] with PredicateHelper
   def apply(plan: LogicalPlan): LogicalPlan = plan transform {
 
     // Push down deterministic projection through UNION ALL
-    case p @ Project(projectList, Union(children)) =>
-      assert(children.nonEmpty)
+    case p @ Project(projectList, u: Union) =>
+      assert(u.children.nonEmpty)
       if (projectList.forall(_.deterministic)) {
-        val newFirstChild = Project(projectList, children.head)
-        val newOtherChildren = children.tail.map { child =>
-          val rewrites = buildRewrites(children.head, child)
+        val newFirstChild = Project(projectList, u.children.head)
+        val newOtherChildren = u.children.tail.map { child =>
+          val rewrites = buildRewrites(u.children.head, child)
           Project(projectList.map(pushToRight(_, rewrites)), child)
         }
-        Union(newFirstChild +: newOtherChildren)
+        u.copy(children = newFirstChild +: newOtherChildren)
       } else {
         p
       }
@@ -588,6 +646,9 @@ object ColumnPruning extends Rule[LogicalPlan] {
         .map(_._2)
       p.copy(child = g.copy(child = newChild, unrequiredChildIndex = unrequiredIndices))
 
+    // prune unrequired nested fields from `Generate`.
+    case GeneratorNestedColumnAliasing(p) => p
+
     // Eliminate unneeded attributes from right side of a Left Existence Join.
     case j @ Join(_, right, LeftExistence(_), _, _) =>
       j.copy(right = prunedChild(right, j.references))
@@ -620,8 +681,7 @@ object ColumnPruning extends Rule[LogicalPlan] {
     // Can't prune the columns on LeafNode
     case p @ Project(_, _: LeafNode) => p
 
-    case p @ NestedColumnAliasing(nestedFieldToAlias, attrToAliases) =>
-      NestedColumnAliasing.replaceToAliases(p, nestedFieldToAlias, attrToAliases)
+    case NestedColumnAliasing(p) => p
 
     // for all other logical plans that inherits the output from it's children
     // Project over project is handled by the first case, skip it here.
@@ -650,7 +710,9 @@ object ColumnPruning extends Rule[LogicalPlan] {
    */
   private def removeProjectBeforeFilter(plan: LogicalPlan): LogicalPlan = plan transformUp {
     case p1 @ Project(_, f @ Filter(_, p2 @ Project(_, child)))
-      if p2.outputSet.subsetOf(child.outputSet) =>
+      if p2.outputSet.subsetOf(child.outputSet) &&
+        // We only remove attribute-only project.
+        p2.projectList.forall(_.isInstanceOf[AttributeReference]) =>
       p1.copy(child = f.copy(child = child))
   }
 }
@@ -859,13 +921,13 @@ object InferFiltersFromConstraints extends Rule[LogicalPlan]
   private def getAllConstraints(
       left: LogicalPlan,
       right: LogicalPlan,
-      conditionOpt: Option[Expression]): Set[Expression] = {
+      conditionOpt: Option[Expression]): ExpressionSet = {
     val baseConstraints = left.constraints.union(right.constraints)
-      .union(conditionOpt.map(splitConjunctivePredicates).getOrElse(Nil).toSet)
+      .union(ExpressionSet(conditionOpt.map(splitConjunctivePredicates).getOrElse(Nil)))
     baseConstraints.union(inferAdditionalConstraints(baseConstraints))
   }
 
-  private def inferNewFilter(plan: LogicalPlan, constraints: Set[Expression]): LogicalPlan = {
+  private def inferNewFilter(plan: LogicalPlan, constraints: ExpressionSet): LogicalPlan = {
     val newPredicates = constraints
       .union(constructIsNotNullConstraints(constraints, plan.output))
       .filter { c =>
@@ -889,19 +951,28 @@ object CombineUnions extends Rule[LogicalPlan] {
   }
 
   private def flattenUnion(union: Union, flattenDistinct: Boolean): Union = {
+    val topByName = union.byName
+    val topAllowMissingCol = union.allowMissingCol
+
     val stack = mutable.Stack[LogicalPlan](union)
     val flattened = mutable.ArrayBuffer.empty[LogicalPlan]
+    // Note that we should only flatten the unions with same byName and allowMissingCol.
+    // Although we do `UnionCoercion` at analysis phase, we manually run `CombineUnions`
+    // in some places like `Dataset.union`. Flattening unions with different resolution
+    // rules (by position and by name) could cause incorrect results.
     while (stack.nonEmpty) {
       stack.pop() match {
-        case Distinct(Union(children)) if flattenDistinct =>
+        case Distinct(Union(children, byName, allowMissingCol))
+            if flattenDistinct && byName == topByName && allowMissingCol == topAllowMissingCol =>
           stack.pushAll(children.reverse)
-        case Union(children) =>
+        case Union(children, byName, allowMissingCol)
+            if byName == topByName && allowMissingCol == topAllowMissingCol =>
           stack.pushAll(children.reverse)
         case child =>
           flattened += child
       }
     }
-    Union(flattened)
+    union.copy(children = flattened.toSeq)
   }
 }
 
@@ -910,7 +981,9 @@ object CombineUnions extends Rule[LogicalPlan] {
  * one conjunctive predicate.
  */
 object CombineFilters extends Rule[LogicalPlan] with PredicateHelper {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan transform applyLocally
+
+  val applyLocally: PartialFunction[LogicalPlan, LogicalPlan] = {
     // The query execution/optimization does not guarantee the expressions are evaluated in order.
     // We only can combine them if and only if both are deterministic.
     case Filter(fc, nf @ Filter(nc, grandChild)) if fc.deterministic && nc.deterministic =>
@@ -925,39 +998,67 @@ object CombineFilters extends Rule[LogicalPlan] with PredicateHelper {
 }
 
 /**
- * Removes no-op SortOrder from Sort
+ * Removes Sort operations if they don't affect the final output ordering.
+ * Note that changes in the final output ordering may affect the file size (SPARK-32318).
+ * This rule handles the following cases:
+ * 1) if the sort order is empty or the sort order does not have any reference
+ * 2) if the child is already sorted
+ * 3) if there is another Sort operator separated by 0...n Project, Filter, Repartition or
+ *    RepartitionByExpression (with deterministic expressions) operators
+ * 4) if the Sort operator is within Join separated by 0...n Project, Filter, Repartition or
+ *    RepartitionByExpression (with deterministic expressions) operators only and the Join condition
+ *    is deterministic
+ * 5) if the Sort operator is within GroupBy separated by 0...n Project, Filter, Repartition or
+ *    RepartitionByExpression (with deterministic expressions) operators only and the aggregate
+ *    function is order irrelevant
  */
 object EliminateSorts extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = plan transform {
     case s @ Sort(orders, _, child) if orders.isEmpty || orders.exists(_.child.foldable) =>
       val newOrders = orders.filterNot(_.child.foldable)
       if (newOrders.isEmpty) child else s.copy(order = newOrders)
-  }
-}
-
-/**
- * Removes redundant Sort operation. This can happen:
- * 1) if the child is already sorted
- * 2) if there is another Sort operator separated by 0...n Project/Filter operators
- */
-object RemoveRedundantSorts extends Rule[LogicalPlan] {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformDown {
     case Sort(orders, true, child) if SortOrder.orderingSatisfies(child.outputOrdering, orders) =>
       child
     case s @ Sort(_, _, child) => s.copy(child = recursiveRemoveSort(child))
+    case j @ Join(originLeft, originRight, _, cond, _) if cond.forall(_.deterministic) =>
+      j.copy(left = recursiveRemoveSort(originLeft), right = recursiveRemoveSort(originRight))
+    case g @ Aggregate(_, aggs, originChild) if isOrderIrrelevantAggs(aggs) =>
+      g.copy(child = recursiveRemoveSort(originChild))
   }
 
-  def recursiveRemoveSort(plan: LogicalPlan): LogicalPlan = plan match {
+  private def recursiveRemoveSort(plan: LogicalPlan): LogicalPlan = plan match {
     case Sort(_, _, child) => recursiveRemoveSort(child)
     case other if canEliminateSort(other) =>
       other.withNewChildren(other.children.map(recursiveRemoveSort))
     case _ => plan
   }
 
-  def canEliminateSort(plan: LogicalPlan): Boolean = plan match {
+  private def canEliminateSort(plan: LogicalPlan): Boolean = plan match {
     case p: Project => p.projectList.forall(_.deterministic)
     case f: Filter => f.condition.deterministic
+    case r: RepartitionByExpression => r.partitionExpressions.forall(_.deterministic)
+    case _: Repartition => true
     case _ => false
+  }
+
+  private def isOrderIrrelevantAggs(aggs: Seq[NamedExpression]): Boolean = {
+    def isOrderIrrelevantAggFunction(func: AggregateFunction): Boolean = func match {
+      case _: Min | _: Max | _: Count => true
+      // Arithmetic operations for floating-point values are order-sensitive
+      // (they are not associative).
+      case _: Sum | _: Average | _: CentralMomentAgg =>
+        !Seq(FloatType, DoubleType).exists(_.sameType(func.children.head.dataType))
+      case _ => false
+    }
+
+    def checkValidAggregateExpression(expr: Expression): Boolean = expr match {
+      case _: AttributeReference => true
+      case ae: AggregateExpression => isOrderIrrelevantAggFunction(ae.aggregateFunction)
+      case _: UserDefinedExpression => false
+      case e => e.children.forall(checkValidAggregateExpression)
+    }
+
+    aggs.forall(checkValidAggregateExpression)
   }
 }
 
@@ -996,14 +1097,29 @@ object PruneFilters extends Rule[LogicalPlan] with PredicateHelper {
 }
 
 /**
+ * The unified version for predicate pushdown of normal operators and joins.
+ * This rule improves performance of predicate pushdown for cascading joins such as:
+ *  Filter-Join-Join-Join. Most predicates can be pushed down in a single pass.
+ */
+object PushDownPredicates extends Rule[LogicalPlan] with PredicateHelper {
+  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+    CombineFilters.applyLocally
+      .orElse(PushPredicateThroughNonJoin.applyLocally)
+      .orElse(PushPredicateThroughJoin.applyLocally)
+  }
+}
+
+/**
  * Pushes [[Filter]] operators through many operators iff:
  * 1) the operator is deterministic
  * 2) the predicate is deterministic and the operator will not change any of rows.
  *
  * This heuristic is valid assuming the expression evaluation cost is minimal.
  */
-object PushDownPredicate extends Rule[LogicalPlan] with PredicateHelper {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+object PushPredicateThroughNonJoin extends Rule[LogicalPlan] with PredicateHelper {
+  def apply(plan: LogicalPlan): LogicalPlan = plan transform applyLocally
+
+  val applyLocally: PartialFunction[LogicalPlan, LogicalPlan] = {
     // SPARK-13473: We can't push the predicate down when the underlying projection output non-
     // deterministic field(s).  Non-deterministic expressions are essentially stateful. This
     // implies that, for a given input row, the output are determined by the expression's initial
@@ -1124,9 +1240,10 @@ object PushDownPredicate extends Rule[LogicalPlan] with PredicateHelper {
 
   def getAliasMap(plan: Aggregate): AttributeMap[Expression] = {
     // Find all the aliased expressions in the aggregate list that don't include any actual
-    // AggregateExpression, and create a map from the alias to the expression
+    // AggregateExpression or PythonUDF, and create a map from the alias to the expression
     val aliasMap = plan.aggregateExpressions.collect {
-      case a: Alias if a.child.find(_.isInstanceOf[AggregateExpression]).isEmpty =>
+      case a: Alias if a.child.find(e => e.isInstanceOf[AggregateExpression] ||
+          PythonUDF.isGroupedAggPandasUDF(e)).isEmpty =>
         (a.toAttribute, a.child)
     }
     AttributeMap(aliasMap)
@@ -1143,6 +1260,8 @@ object PushDownPredicate extends Rule[LogicalPlan] with PredicateHelper {
     case _: Repartition => true
     case _: ScriptTransformation => true
     case _: Sort => true
+    case _: BatchEvalPython => true
+    case _: ArrowEvalPython => true
     case _ => false
   }
 
@@ -1218,9 +1337,17 @@ object PushPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHelper {
     (leftEvaluateCondition, rightEvaluateCondition, commonCondition ++ nonDeterministic)
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  private def canPushThrough(joinType: JoinType): Boolean = joinType match {
+    case _: InnerLike | LeftSemi | RightOuter | LeftOuter | LeftAnti | ExistenceJoin(_) => true
+    case _ => false
+  }
+
+  def apply(plan: LogicalPlan): LogicalPlan = plan transform applyLocally
+
+  val applyLocally: PartialFunction[LogicalPlan, LogicalPlan] = {
     // push the where condition down into join filter
-    case f @ Filter(filterCondition, Join(left, right, joinType, joinCondition, hint)) =>
+    case f @ Filter(filterCondition, Join(left, right, joinType, joinCondition, hint))
+        if canPushThrough(joinType) =>
       val (leftFilterConditions, rightFilterConditions, commonFilterCondition) =
         split(splitConjunctivePredicates(filterCondition), left, right)
       joinType match {
@@ -1260,13 +1387,13 @@ object PushPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHelper {
 
           (rightFilterConditions ++ commonFilterCondition).
             reduceLeftOption(And).map(Filter(_, newJoin)).getOrElse(newJoin)
-        case FullOuter => f // DO Nothing for Full Outer Join
-        case NaturalJoin(_) => sys.error("Untransformed NaturalJoin node")
-        case UsingJoin(_, _) => sys.error("Untransformed Using join node")
+
+        case other =>
+          throw new IllegalStateException(s"Unexpected join type: $other")
       }
 
     // push down the join filter into sub query scanning if applicable
-    case j @ Join(left, right, joinType, joinCondition, hint) =>
+    case j @ Join(left, right, joinType, joinCondition, hint) if canPushThrough(joinType) =>
       val (leftJoinConditions, rightJoinConditions, commonJoinCondition) =
         split(joinCondition.map(splitConjunctivePredicates).getOrElse(Nil), left, right)
 
@@ -1296,9 +1423,9 @@ object PushPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHelper {
           val newJoinCond = (leftJoinConditions ++ commonJoinCondition).reduceLeftOption(And)
 
           Join(newLeft, newRight, joinType, newJoinCond, hint)
-        case FullOuter => j
-        case NaturalJoin(_) => sys.error("Untransformed NaturalJoin node")
-        case UsingJoin(_, _) => sys.error("Untransformed Using join node")
+
+        case other =>
+          throw new IllegalStateException(s"Unexpected join type: $other")
       }
   }
 }
@@ -1380,7 +1507,7 @@ object DecimalAggregates extends Rule[LogicalPlan] {
 
   def apply(plan: LogicalPlan): LogicalPlan = plan transform {
     case q: LogicalPlan => q transformExpressionsDown {
-      case we @ WindowExpression(ae @ AggregateExpression(af, _, _, _), _) => af match {
+      case we @ WindowExpression(ae @ AggregateExpression(af, _, _, _, _), _) => af match {
         case Sum(e @ DecimalType.Expression(prec, scale)) if prec + 10 <= MAX_LONG_DIGITS =>
           MakeDecimal(we.copy(windowFunction = ae.copy(aggregateFunction = Sum(UnscaledValue(e)))),
             prec + 10, scale)
@@ -1394,7 +1521,7 @@ object DecimalAggregates extends Rule[LogicalPlan] {
 
         case _ => we
       }
-      case ae @ AggregateExpression(af, _, _, _) => af match {
+      case ae @ AggregateExpression(af, _, _, _, _) => af match {
         case Sum(e @ DecimalType.Expression(prec, scale)) if prec + 10 <= MAX_LONG_DIGITS =>
           MakeDecimal(ae.copy(aggregateFunction = Sum(UnscaledValue(e))), prec + 10, scale)
 
@@ -1418,16 +1545,16 @@ object ConvertToLocalRelation extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = plan transform {
     case Project(projectList, LocalRelation(output, data, isStreaming))
         if !projectList.exists(hasUnevaluableExpr) =>
-      val projection = new InterpretedProjection(projectList, output)
+      val projection = new InterpretedMutableProjection(projectList, output)
       projection.initialize(0)
-      LocalRelation(projectList.map(_.toAttribute), data.map(projection), isStreaming)
+      LocalRelation(projectList.map(_.toAttribute), data.map(projection(_).copy()), isStreaming)
 
     case Limit(IntegerLiteral(limit), LocalRelation(output, data, isStreaming)) =>
       LocalRelation(output, data.take(limit), isStreaming)
 
     case Filter(condition, LocalRelation(output, data, isStreaming))
         if !hasUnevaluableExpr(condition) =>
-      val predicate = InterpretedPredicate.create(condition, output)
+      val predicate = Predicate.create(condition, output)
       predicate.initialize(0)
       LocalRelation(output, data.filter(row => predicate.eval(row)), isStreaming)
   }

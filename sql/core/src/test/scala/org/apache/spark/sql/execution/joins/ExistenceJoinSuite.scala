@@ -19,16 +19,17 @@ package org.apache.spark.sql.execution.joins
 
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical.{Join, JoinHint}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, SparkPlan, SparkPlanTest}
 import org.apache.spark.sql.execution.exchange.EnsureRequirements
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{BooleanType, DoubleType, IntegerType, StructType}
 
-class ExistenceJoinSuite extends SparkPlanTest with SharedSQLContext {
+class ExistenceJoinSuite extends SparkPlanTest with SharedSparkSession {
 
   private lazy val left = spark.createDataFrame(
     sparkContext.parallelize(Seq(
@@ -200,6 +201,14 @@ class ExistenceJoinSuite extends SparkPlanTest with SharedSQLContext {
     Seq(Row(2, 1.0), Row(2, 1.0), Row(3, 3.0), Row(6, null)))
 
   testExistenceJoin(
+    "test single unique condition (equal) for left semi join",
+    LeftSemi,
+    left,
+    right.select(right.col("c")).distinct(), /* Trigger BHJs and SHJs unique key code path! */
+    singleConditionEQ,
+    Seq(Row(2, 1.0), Row(2, 1.0), Row(3, 3.0), Row(6, null)))
+
+  testExistenceJoin(
     "test composed condition (equal & non-equal) for left semi join",
     LeftSemi,
     left,
@@ -228,7 +237,7 @@ class ExistenceJoinSuite extends SparkPlanTest with SharedSQLContext {
     "test single unique condition (equal) for left Anti join",
     LeftAnti,
     left,
-    right.select(right.col("c")).distinct(), /* Trigger BHJs unique key code path! */
+    right.select(right.col("c")).distinct(), /* Trigger BHJs and SHJs unique key code path! */
     singleConditionEQ,
     Seq(Row(1, 2.0), Row(1, 2.0), Row(null, null), Row(null, 5.0)))
 

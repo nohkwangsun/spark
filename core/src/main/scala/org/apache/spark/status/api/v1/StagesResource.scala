@@ -17,14 +17,10 @@
 package org.apache.spark.status.api.v1
 
 import java.util.{HashMap, List => JList, Locale}
-import javax.ws.rs._
+import javax.ws.rs.{NotFoundException => _, _}
 import javax.ws.rs.core.{Context, MediaType, MultivaluedMap, UriInfo}
 
-import org.apache.spark.SparkException
-import org.apache.spark.scheduler.StageInfo
-import org.apache.spark.status.api.v1.StageStatus._
-import org.apache.spark.status.api.v1.TaskSorting._
-import org.apache.spark.ui.{SparkUI, UIUtils}
+import org.apache.spark.ui.UIUtils
 import org.apache.spark.ui.jobs.ApiHelper._
 import org.apache.spark.util.Utils
 
@@ -100,8 +96,9 @@ private[v1] class StagesResource extends BaseAppResource {
       @PathParam("stageAttemptId") stageAttemptId: Int,
       @DefaultValue("0") @QueryParam("offset") offset: Int,
       @DefaultValue("20") @QueryParam("length") length: Int,
-      @DefaultValue("ID") @QueryParam("sortBy") sortBy: TaskSorting): Seq[TaskData] = {
-    withUI(_.store.taskList(stageId, stageAttemptId, offset, length, sortBy))
+      @DefaultValue("ID") @QueryParam("sortBy") sortBy: TaskSorting,
+      @QueryParam("status") statuses: JList[TaskStatus]): Seq[TaskData] = {
+    withUI(_.store.taskList(stageId, stageAttemptId, offset, length, sortBy, statuses))
   }
 
   // This api needs to stay formatted exactly as it is below, since, it is being used by the

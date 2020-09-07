@@ -130,8 +130,11 @@ object PartitioningUtils {
       Map.empty[String, String]
     }
 
-    val dateFormatter = DateFormatter()
-    val timestampFormatter = TimestampFormatter(timestampPartitionPattern, zoneId)
+    val dateFormatter = DateFormatter(zoneId)
+    val timestampFormatter = TimestampFormatter(
+      timestampPartitionPattern,
+      zoneId,
+      isParsing = true)
     // First, we need to parse every partition's path and see if we can find partition values.
     val (partitionValues, optDiscoveredBasePaths) = paths.map { path =>
       parsePartition(path, typeInference, basePaths, userSpecifiedDataTypes,
@@ -270,7 +273,7 @@ object PartitioningUtils {
       (None, Some(path))
     } else {
       val (columnNames, values) = columns.reverse.unzip
-      (Some(PartitionValues(columnNames, values)), Some(currentPath))
+      (Some(PartitionValues(columnNames.toSeq, values.toSeq)), Some(currentPath))
     }
   }
 
@@ -417,7 +420,7 @@ object PartitioningUtils {
     val distinctPartColNames = pathWithPartitionValues.map(_._2.columnNames).distinct
 
     def groupByKey[K, V](seq: Seq[(K, V)]): Map[K, Iterable[V]] =
-      seq.groupBy { case (key, _) => key }.mapValues(_.map { case (_, value) => value })
+      seq.groupBy { case (key, _) => key }.mapValues(_.map { case (_, value) => value }).toMap
 
     val partColNamesToPaths = groupByKey(pathWithPartitionValues.map {
       case (path, partValues) => partValues.columnNames -> path
@@ -492,7 +495,7 @@ object PartitioningUtils {
       // We need to check that we can cast the raw string since we later can use Cast to get
       // the partition values with the right DataType (see
       // org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex.inferPartitioning)
-      val dateValue = Cast(Literal(raw), DateType).eval()
+      val dateValue = Cast(Literal(raw), DateType, Some(zoneId.getId)).eval()
       // Disallow DateType if the cast returned null
       require(dateValue != null)
       Literal.create(dateValue, DateType)
@@ -541,6 +544,9 @@ object PartitioningUtils {
       schema: StructType,
       partitionColumns: Seq[String],
       caseSensitive: Boolean): Unit = {
+
+    SchemaUtils.checkColumnNameDuplication(
+      partitionColumns, partitionColumns.mkString(", "), caseSensitive)
 
     partitionColumnsSchema(schema, partitionColumns, caseSensitive).foreach {
       field => field.dataType match {

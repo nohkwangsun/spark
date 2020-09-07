@@ -20,7 +20,6 @@ package org.apache.spark.sql.internal
 import scala.reflect.runtime.universe.TypeTag
 import scala.util.control.NonFatal
 
-import org.apache.spark.annotation.Experimental
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalog.{Catalog, Column, Database, Function, Table}
 import org.apache.spark.sql.catalyst.{DefinedByConstructorParams, FunctionIdentifier, TableIdentifier}
@@ -277,34 +276,29 @@ class CatalogImpl(sparkSession: SparkSession) extends Catalog {
   }
 
   /**
-   * :: Experimental ::
    * Creates a table from the given path and returns the corresponding DataFrame.
    * It will use the default data source configured by spark.sql.sources.default.
    *
    * @group ddl_ops
    * @since 2.2.0
    */
-  @Experimental
   override def createTable(tableName: String, path: String): DataFrame = {
     val dataSourceName = sparkSession.sessionState.conf.defaultDataSourceName
     createTable(tableName, path, dataSourceName)
   }
 
   /**
-   * :: Experimental ::
    * Creates a table from the given path and returns the corresponding
    * DataFrame.
    *
    * @group ddl_ops
    * @since 2.2.0
    */
-  @Experimental
   override def createTable(tableName: String, path: String, source: String): DataFrame = {
     createTable(tableName, source, Map("path" -> path))
   }
 
   /**
-   * :: Experimental ::
    * (Scala-specific)
    * Creates a table based on the dataset in a data source and a set of options.
    * Then, returns the corresponding DataFrame.
@@ -312,7 +306,6 @@ class CatalogImpl(sparkSession: SparkSession) extends Catalog {
    * @group ddl_ops
    * @since 2.2.0
    */
-  @Experimental
   override def createTable(
       tableName: String,
       source: String,
@@ -321,7 +314,22 @@ class CatalogImpl(sparkSession: SparkSession) extends Catalog {
   }
 
   /**
-   * :: Experimental ::
+   * (Scala-specific)
+   * Creates a table based on the dataset in a data source and a set of options.
+   * Then, returns the corresponding DataFrame.
+   *
+   * @group ddl_ops
+   * @since 3.1.0
+   */
+  override def createTable(
+      tableName: String,
+      source: String,
+      description: String,
+      options: Map[String, String]): DataFrame = {
+    createTable(tableName, source, new StructType, description, options)
+  }
+
+  /**
    * (Scala-specific)
    * Creates a table based on the dataset in a data source, a schema and a set of options.
    * Then, returns the corresponding DataFrame.
@@ -329,11 +337,33 @@ class CatalogImpl(sparkSession: SparkSession) extends Catalog {
    * @group ddl_ops
    * @since 2.2.0
    */
-  @Experimental
   override def createTable(
       tableName: String,
       source: String,
       schema: StructType,
+      options: Map[String, String]): DataFrame = {
+    createTable(
+      tableName = tableName,
+      source = source,
+      schema = schema,
+      description = "",
+      options = options
+    )
+  }
+
+  /**
+   * (Scala-specific)
+   * Creates a table based on the dataset in a data source, a schema and a set of options.
+   * Then, returns the corresponding DataFrame.
+   *
+   * @group ddl_ops
+   * @since 3.1.0
+   */
+  override def createTable(
+      tableName: String,
+      source: String,
+      schema: StructType,
+      description: String,
       options: Map[String, String]): DataFrame = {
     val tableIdent = sparkSession.sessionState.sqlParser.parseTableIdentifier(tableName)
     val storage = DataSource.buildStorageFormatFromOptions(options)
@@ -347,7 +377,8 @@ class CatalogImpl(sparkSession: SparkSession) extends Catalog {
       tableType = tableType,
       storage = storage,
       schema = schema,
-      provider = Some(source)
+      provider = Some(source),
+      comment = { if (description.isEmpty) None else Some(description) }
     )
     val plan = CreateTable(tableDesc, SaveMode.ErrorIfExists, None)
     sparkSession.sessionState.executePlan(plan).toRdd
@@ -526,10 +557,11 @@ private[sql] object CatalogImpl {
       data: Seq[T],
       sparkSession: SparkSession): Dataset[T] = {
     val enc = ExpressionEncoder[T]()
-    val encoded = data.map(d => enc.toRow(d).copy())
+    val toRow = enc.createSerializer()
+    val encoded = data.map(d => toRow(d).copy())
     val plan = new LocalRelation(enc.schema.toAttributes, encoded)
     val queryExecution = sparkSession.sessionState.executePlan(plan)
-    new Dataset[T](sparkSession, queryExecution, enc)
+    new Dataset[T](queryExecution, enc)
   }
 
 }
